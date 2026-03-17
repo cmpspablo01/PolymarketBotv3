@@ -1,0 +1,18 @@
+project:
+  name: polymarket-btc15m-research
+  env: development  # development | production
+
+logging:
+  level: INFO          # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  log_dir: logs
+  log_file: polymarket_research.log
+  console: true        # emit readable output to stdout
+  json_to_file: true   # emit JSON lines to log_file
+
+storage:
+  data_dir: data
+  market_snapshots_dir: data/markets   # discovered market metadata
+  price_data_dir: data/prices          # price and orderbook snapshots
+
+runner:
+  heartbeat_interval_seconds: 60
