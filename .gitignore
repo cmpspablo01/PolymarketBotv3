@@ -21,7 +21,7 @@ ENV/
 
 # Runtime output — generated at runtime, not source
 logs/
-data/
+/data/
 
 # Tool caches
 .mypy_cache/

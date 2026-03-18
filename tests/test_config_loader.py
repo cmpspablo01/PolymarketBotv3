@@ -21,7 +21,6 @@ import yaml
 
 from src.config_loader import ConfigurationError, Settings, load_config
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

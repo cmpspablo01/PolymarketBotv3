@@ -13,6 +13,7 @@ dependencies = [
     "pyyaml>=5.3",
     "python-dotenv>=1.0",
     "structlog>=24.0",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +22,7 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.4.0",
     "mypy>=1.10",
+    "types-requests>=2.31",
 ]
 
 [project.scripts]

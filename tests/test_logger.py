@@ -25,7 +25,6 @@ import structlog
 from src.config_loader import LoggingConfig
 from src.logger import get_logger, setup_logging
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
