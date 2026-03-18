@@ -57,8 +57,21 @@ class StorageConfig(BaseModel):
     price_data_dir: str
 
 
+class PolymarketConfig(BaseModel):
+    base_url: str
+
+
 class RunnerConfig(BaseModel):
     heartbeat_interval_seconds: int
+    mode: str = "loop"
+
+    @field_validator("mode")
+    @classmethod
+    def mode_must_be_valid(cls, v: str) -> str:
+        allowed = {"once", "loop"}
+        if v not in allowed:
+            raise ValueError(f"runner.mode must be one of {allowed}, got '{v}'")
+        return v
 
 
 class Settings(BaseModel):
@@ -66,6 +79,7 @@ class Settings(BaseModel):
     logging: LoggingConfig
     storage: StorageConfig
     runner: RunnerConfig
+    polymarket: PolymarketConfig
 
 
 def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:

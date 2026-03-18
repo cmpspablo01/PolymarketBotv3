@@ -6,10 +6,10 @@ Startup sequence (order is intentional):
   2. Create required directories      — before logging opens file handles
   3. Initialize structured logging    — all subsequent output is structured
   4. Register shutdown signal handlers
-  5. Emit startup log
-  6. Run heartbeat loop               — Phase 1 stub; fetcher will plug in here
+  5. Build data pipeline components   — explicit construction, no DI framework
+  6. Run collection cycle(s)          — once or loop per runner.mode
 
-Phase 1 status: No market fetching. Heartbeat loop is a placeholder.
+Phase 1 status: End-to-end data collection wired.
 """
 
 from __future__ import annotations
@@ -19,9 +19,15 @@ import sys
 import threading
 from pathlib import Path
 from types import FrameType
+from typing import Any
 
 from src.config_loader import ConfigurationError, Settings, load_config
+from src.data.fetcher import DataFetcher, FetchCycleResult
+from src.data.storage import DataStorage
 from src.logger import get_logger, setup_logging
+from src.polymarket.http_client import PolymarketHTTPClient
+from src.polymarket.markets import MarketDiscovery
+from src.polymarket.prices import PriceFetcher
 
 # Event set by signal handlers — .wait(timeout=N) returns immediately when set.
 # Replaces time.sleep() which blocks for the full duration and delays shutdown.
@@ -43,6 +49,60 @@ def _ensure_directories(settings: Settings) -> None:
     ]
     for dir_path in dirs:
         Path(dir_path).mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Cycle helpers — extracted for testability
+# ---------------------------------------------------------------------------
+
+
+def _run_once(fetcher: DataFetcher, log: Any) -> FetchCycleResult:
+    """Execute a single fetch cycle and log the result."""
+    log.info("cycle_start", mode="once")
+    result = fetcher.run_cycle()
+    log.info(
+        "cycle_complete",
+        markets_found=result.markets_found,
+        prices_stored=result.prices_stored,
+        orderbooks_stored=result.orderbooks_stored,
+        errors=result.errors,
+    )
+    return result
+
+
+def _run_loop(
+    fetcher: DataFetcher,
+    interval: int,
+    shutdown_event: threading.Event,
+    log: Any,
+) -> None:
+    """
+    Run fetch cycles in a loop until *shutdown_event* is set.
+
+    Uses ``threading.Event.wait(timeout=N)`` instead of ``time.sleep(N)``
+    so that shutdown is instant when the signal handler fires.
+    Per-cycle exceptions are caught and logged; the loop continues.
+    """
+    log.info("loop_started", interval_seconds=interval)
+    while not shutdown_event.is_set():
+        log.info("cycle_start")
+        try:
+            result = fetcher.run_cycle()
+            log.info(
+                "cycle_complete",
+                markets_found=result.markets_found,
+                prices_stored=result.prices_stored,
+                orderbooks_stored=result.orderbooks_stored,
+                errors=result.errors,
+            )
+        except Exception as exc:
+            log.error("cycle_failed", error=str(exc))
+        shutdown_event.wait(timeout=interval)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -69,30 +129,34 @@ def main() -> None:
         "startup",
         project=settings.project.name,
         env=settings.project.env,
+        mode=settings.runner.mode,
     )
 
-    # TODO: Phase 1 — instantiate market discovery (src/polymarket/markets.py)
-    # TODO: Phase 1 — instantiate price fetcher (src/data/fetcher.py)
-    # TODO: Phase 1 — instantiate storage writer (src/data/storage.py)
-
-    # 6. Heartbeat loop — placeholder until Phase 1 fetcher is wired in
-    # Uses threading.Event.wait(timeout=N) instead of time.sleep(N).
-    # Shutdown is instant: signal handler calls _shutdown_event.set(),
-    # and .wait() returns immediately instead of blocking for the full interval.
-    interval = settings.runner.heartbeat_interval_seconds
-    log.info("heartbeat_loop_started", interval_seconds=interval)
-
+    # 6. Build components explicitly — no DI framework
+    client = PolymarketHTTPClient(base_url=settings.polymarket.base_url)
     try:
-        while not _shutdown_event.is_set():
-            log.info("heartbeat")
+        discovery = MarketDiscovery(client)
+        price_fetcher = PriceFetcher(client)
+        storage = DataStorage(base_dir=Path(settings.storage.data_dir))
+        fetcher = DataFetcher(discovery, price_fetcher, storage)
 
-            # TODO: Phase 1 — call fetcher.run_once() here on each heartbeat
+        log.info("components_ready")
 
-            _shutdown_event.wait(timeout=interval)
+        # 7. Run
+        if settings.runner.mode == "once":
+            _run_once(fetcher, log)
+        else:
+            _run_loop(
+                fetcher,
+                settings.runner.heartbeat_interval_seconds,
+                _shutdown_event,
+                log,
+            )
     except KeyboardInterrupt:
         # Fallback: handles KeyboardInterrupt if signal handler was not reached
         pass
     finally:
+        client.close()
         log.info("shutdown")
 
 

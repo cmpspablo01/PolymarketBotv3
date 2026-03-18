@@ -16,3 +16,7 @@ storage:
 
 runner:
   heartbeat_interval_seconds: 60
+  mode: loop  # once | loop
+
+polymarket:
+  base_url: https://clob.polymarket.com

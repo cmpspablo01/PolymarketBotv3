@@ -42,6 +42,7 @@ def _make_valid_raw() -> dict[str, Any]:
             "price_data_dir": "data/prices",
         },
         "runner": {"heartbeat_interval_seconds": 60},
+        "polymarket": {"base_url": "https://clob.polymarket.com"},
     }
 
 
