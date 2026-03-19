@@ -137,6 +137,60 @@ def test_market_group_id_and_category_set() -> None:
     assert market.category == "Crypto"
 
 
+def test_market_enriched_fields_optional() -> None:
+    """New enriched fields all default to None."""
+    market = Market(
+        condition_id="cond_010",
+        question="BTC > 90k?",
+        tokens=_make_tokens(),
+        active=True,
+        closed=False,
+    )
+    assert market.slug is None
+    assert market.market_id is None
+    assert market.event_id is None
+    assert market.event_slug is None
+    assert market.description is None
+    assert market.start_date is None
+    assert market.event_start_time is None
+
+
+def test_market_enriched_fields_set() -> None:
+    market = Market(
+        condition_id="cond_011",
+        question="Bitcoin Up or Down - March 19, 4:00PM-4:15PM ET",
+        tokens=_make_tokens(),
+        active=True,
+        closed=False,
+        slug="btc-updown-15m-123",
+        market_id="55555",
+        event_id="99001",
+        event_slug="ev-slug",
+        description="Resolves Up if BTC...",
+        start_date=datetime(2025, 3, 18, 15, 45, tzinfo=timezone.utc),
+        event_start_time=datetime(2025, 3, 19, 16, 0, tzinfo=timezone.utc),
+    )
+    assert market.slug == "btc-updown-15m-123"
+    assert market.market_id == "55555"
+    assert market.event_id == "99001"
+    assert market.event_slug == "ev-slug"
+    assert market.description == "Resolves Up if BTC..."
+    assert market.start_date == datetime(2025, 3, 18, 15, 45, tzinfo=timezone.utc)
+    assert market.event_start_time == datetime(2025, 3, 19, 16, 0, tzinfo=timezone.utc)
+
+
+def test_market_event_start_time_parsed_from_iso_string() -> None:
+    market = Market(
+        condition_id="cond_012",
+        question="BTC > 90k?",
+        tokens=_make_tokens(),
+        active=True,
+        closed=False,
+        event_start_time="2026-03-19T00:45:00Z",  # type: ignore[arg-type]
+    )
+    assert isinstance(market.event_start_time, datetime)
+
+
 def test_market_missing_condition_id_raises() -> None:
     with pytest.raises(ValidationError):
         Market(  # type: ignore[call-arg]

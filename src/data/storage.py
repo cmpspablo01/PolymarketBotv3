@@ -3,18 +3,20 @@ Raw data persistence for Polymarket research data.
 
 Responsibilities:
   - Write market discovery snapshots as JSON files
-  - Append price records to daily JSONL files
-  - Append orderbook records to daily JSONL files
+  - Append price records to daily JSONL files (with traceability context)
+  - Append orderbook records to daily JSONL files (with traceability context)
   - Create directories as needed
 
-File layout (under base_dir)::
+File layout::
 
-    markets/
+    {markets_dir}/
         markets_20250318T160000_000Z.json — one JSON per snapshot (ms precision)
-    prices/
+    {prices_dir}/
         prices_2025-03-18.jsonl         — one line per price record, daily rolling
-    orderbooks/
+    {orderbooks_dir}/
         orderbooks_2025-03-18.jsonl     — one line per orderbook record, daily
+
+Directory paths are provided explicitly by the caller (from config).
 
 Timestamp policy:
   - API timestamps are preserved as-is in record content (source of truth).
@@ -24,6 +26,13 @@ Timestamp policy:
   - Price JSONL filenames use the date from the record's own API timestamp.
   - Orderbook JSONL filenames use the date from the record's API timestamp.
   - If any API timestamp is missing, a local UTC fallback is used and logged.
+
+Traceability:
+  - ``append_price`` and ``append_orderbook`` accept an optional *context*
+    dict that is merged into each record.  Callers use this to inject
+    market-level identifiers (condition_id, outcome, slug, event_id, etc.)
+    so that every price/orderbook line can be traced back to its market
+    without rebuilding the mapping externally.
 """
 
 from __future__ import annotations
@@ -45,14 +54,25 @@ class DataStorage:
 
     Usage::
 
-        storage = DataStorage(Path("data"))
+        storage = DataStorage(
+            markets_dir=Path("data/markets"),
+            prices_dir=Path("data/prices"),
+            orderbooks_dir=Path("data/orderbooks"),
+        )
         storage.save_market_snapshot(markets, snapshot_ts)
-        storage.append_price(price)
-        storage.append_orderbook(orderbook)
+        storage.append_price(price, context={...})
+        storage.append_orderbook(orderbook, context={...})
     """
 
-    def __init__(self, base_dir: Path) -> None:
-        self._base_dir = base_dir
+    def __init__(
+        self,
+        markets_dir: Path,
+        prices_dir: Path,
+        orderbooks_dir: Path,
+    ) -> None:
+        self._markets_dir = markets_dir
+        self._prices_dir = prices_dir
+        self._orderbooks_dir = orderbooks_dir
 
     # ------------------------------------------------------------------
     # Market snapshots (JSON)
@@ -72,13 +92,12 @@ class DataStorage:
 
         Returns the path to the written file.
         """
-        dir_path = self._base_dir / "markets"
-        dir_path.mkdir(parents=True, exist_ok=True)
+        self._markets_dir.mkdir(parents=True, exist_ok=True)
 
         # Millisecond precision prevents collision on rapid successive snapshots.
         ms = snapshot_ts.strftime("%f")[:3]
         ts_str = snapshot_ts.strftime("%Y%m%dT%H%M%S") + f"_{ms}Z"
-        file_path = dir_path / f"markets_{ts_str}.json"
+        file_path = self._markets_dir / f"markets_{ts_str}.json"
 
         payload: dict[str, Any] = {
             "snapshot_ts": snapshot_ts.isoformat(),
@@ -99,7 +118,11 @@ class DataStorage:
     # Price records (JSONL)
     # ------------------------------------------------------------------
 
-    def append_price(self, price: TokenPrice) -> Path:
+    def append_price(
+        self,
+        price: TokenPrice,
+        context: dict[str, Any] | None = None,
+    ) -> Path:
         """
         Append a single price record to the daily JSONL file.
 
@@ -107,10 +130,12 @@ class DataStorage:
         (source of truth).  A separate ``written_at`` field is added for
         write-time auditing only.
 
+        If *context* is provided, its key/value pairs are merged into the
+        record (e.g. condition_id, outcome, slug for traceability).
+
         Returns the path to the JSONL file.
         """
-        dir_path = self._base_dir / "prices"
-        dir_path.mkdir(parents=True, exist_ok=True)
+        self._prices_dir.mkdir(parents=True, exist_ok=True)
 
         # Use the price's API timestamp for daily file naming.
         if price.timestamp is not None:
@@ -123,9 +148,11 @@ class DataStorage:
                 price.token_id,
             )
         date_str = ts.strftime("%Y-%m-%d")
-        file_path = dir_path / f"prices_{date_str}.jsonl"
+        file_path = self._prices_dir / f"prices_{date_str}.jsonl"
 
         record = price.model_dump(mode="json")
+        if context:
+            record.update(context)
         record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
 
         with file_path.open("a", encoding="utf-8") as f:
@@ -137,7 +164,11 @@ class DataStorage:
     # Orderbook records (JSONL)
     # ------------------------------------------------------------------
 
-    def append_orderbook(self, orderbook: Orderbook) -> Path:
+    def append_orderbook(
+        self,
+        orderbook: Orderbook,
+        context: dict[str, Any] | None = None,
+    ) -> Path:
         """
         Append a single orderbook record to the daily JSONL file.
 
@@ -147,10 +178,12 @@ class DataStorage:
         warning).  A ``written_at`` field is added for write-time
         auditing only.
 
+        If *context* is provided, its key/value pairs are merged into the
+        record (e.g. condition_id, outcome, slug for traceability).
+
         Returns the path to the JSONL file.
         """
-        dir_path = self._base_dir / "orderbooks"
-        dir_path.mkdir(parents=True, exist_ok=True)
+        self._orderbooks_dir.mkdir(parents=True, exist_ok=True)
 
         # Use the orderbook's API timestamp for daily file naming.
         if orderbook.timestamp is not None:
@@ -163,9 +196,11 @@ class DataStorage:
                 orderbook.token_id,
             )
         date_str = ts.strftime("%Y-%m-%d")
-        file_path = dir_path / f"orderbooks_{date_str}.jsonl"
+        file_path = self._orderbooks_dir / f"orderbooks_{date_str}.jsonl"
 
         record = orderbook.model_dump(mode="json")
+        if context:
+            record.update(context)
         record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
 
         with file_path.open("a", encoding="utf-8") as f:

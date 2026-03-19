@@ -55,10 +55,12 @@ class StorageConfig(BaseModel):
     data_dir: str
     market_snapshots_dir: str
     price_data_dir: str
+    orderbook_data_dir: str
 
 
 class PolymarketConfig(BaseModel):
     base_url: str
+    gamma_base_url: str
 
 
 class RunnerConfig(BaseModel):

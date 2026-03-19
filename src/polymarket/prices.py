@@ -11,19 +11,22 @@ Does NOT:
   - Contain strategy or execution logic
 
 API assumptions (Phase 1):
-  - GET /price?token_id=X  returns {"price": "0.72"}  (string value)
-    May optionally include a "timestamp" field (ISO 8601 string).
+  - GET /midpoint?token_id=X returns {"mid": "0.72"} (string value).
+    This is the CLOB-native midpoint price.  The older /price endpoint
+    requires a ``side`` parameter (buy|sell) and returns the best bid or
+    ask — NOT a midpoint.  Calling /price without side returns 400.
   - GET /book?token_id=X   returns {"bids": [...], "asks": [...]}
     where each level is {"price": "0.64", "size": "100.0"}  (string values)
     May optionally include a "timestamp" field (ISO 8601 string).
 
-Timestamp priority (applies to both price and orderbook):
-  1. Use the API-provided "timestamp" field if present (ISO 8601 → datetime).
-  2. Fall back to datetime.now(UTC) only when the API omits the field.
+Timestamp policy:
+  - /midpoint does not return a timestamp; we always stamp with local UTC.
+  - /book may include a "timestamp" field (ISO 8601 → datetime);
+    we fall back to datetime.now(UTC) when absent.
 
 Error handling:
-  - _parse_price raises ValueError on non-dict response, missing "price" key,
-    or unparseable price value.  Callers decide how to handle the error.
+  - _parse_midpoint raises ValueError on non-dict response, missing "mid" key,
+    or unparseable mid value.  Callers decide how to handle the error.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ from src.polymarket.models import Orderbook, OrderbookLevel, TokenPrice
 
 log = logging.getLogger(__name__)
 
-PRICE_ENDPOINT = "/price"
+MIDPOINT_ENDPOINT = "/midpoint"
 BOOK_ENDPOINT = "/book"
 
 
@@ -59,16 +62,16 @@ class PriceFetcher:
 
     def fetch_price(self, token_id: str) -> TokenPrice:
         """
-        Fetch the current mid-price for a token.
+        Fetch the CLOB midpoint price for a token via ``/midpoint``.
 
-        Returns a TokenPrice stamped with the API timestamp if available,
-        otherwise with the current UTC time.
+        Returns a TokenPrice stamped with the current UTC time
+        (the /midpoint endpoint does not include a timestamp).
 
         Raises:
-            ValueError: If the response is malformed or the price is missing.
+            ValueError: If the response is malformed or the mid value is missing.
         """
-        raw = self._client.get(PRICE_ENDPOINT, params={"token_id": token_id})
-        return _parse_price(token_id, raw)
+        raw = self._client.get(MIDPOINT_ENDPOINT, params={"token_id": token_id})
+        return _parse_midpoint(token_id, raw)
 
     def fetch_orderbook(self, token_id: str) -> Orderbook:
         """
@@ -83,45 +86,56 @@ class PriceFetcher:
 # ---------------------------------------------------------------------------
 
 
-def _parse_price(token_id: str, raw: Any) -> TokenPrice:
+def _parse_midpoint(token_id: str, raw: Any) -> TokenPrice:
     """
-    Parse raw price API response into a TokenPrice model.
+    Parse a ``/midpoint`` response into a TokenPrice.
 
-    Handles both string and numeric price values from the API.
+    Expected format: ``{"mid": "0.72"}``.
 
     Raises:
-        ValueError: If *raw* is not a dict, the ``price`` key is missing,
+        ValueError: If *raw* is not a dict, the ``mid`` key is missing,
                     or the value cannot be converted to float.
     """
     if not isinstance(raw, dict):
         raise ValueError(
-            f"Expected dict for price response of token {token_id}, "
+            f"Expected dict for midpoint response of token {token_id}, "
             f"got {type(raw).__name__}"
         )
 
-    raw_price = raw.get("price")
-    if raw_price is None:
-        raise ValueError(f"Missing 'price' key in response for token {token_id}")
+    raw_mid = raw.get("mid")
+    if raw_mid is None:
+        raise ValueError(f"Missing 'mid' key in response for token {token_id}")
 
     try:
-        price = float(raw_price)
+        price = float(raw_mid)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"Cannot convert price '{raw_price}' to float for token {token_id}"
+            f"Cannot convert mid '{raw_mid}' to float for token {token_id}"
         ) from exc
-
-    # Timestamp priority: API field first, local UTC fallback.
-    raw_ts = raw.get("timestamp")
-    if raw_ts is not None:
-        # Pydantic will coerce an ISO-8601 string to datetime.
-        timestamp = raw_ts
-    else:
-        timestamp = datetime.now(tz=timezone.utc)
 
     return TokenPrice(
         token_id=token_id,
         price=price,
-        timestamp=timestamp,
+        timestamp=datetime.now(tz=timezone.utc),
+    )
+
+
+def midpoint_from_book(book: Orderbook) -> TokenPrice | None:
+    """
+    Derive a mid-price from the best bid/ask of an orderbook.
+
+    Returns None if the book has no bids or no asks.
+    Used as a fallback when the /price endpoint fails (e.g. neg-risk markets).
+    """
+    if not book.bids or not book.asks:
+        return None
+    best_bid = max(b.price for b in book.bids)
+    best_ask = min(a.price for a in book.asks)
+    mid = round((best_bid + best_ask) / 2, 6)
+    return TokenPrice(
+        token_id=book.token_id,
+        price=mid,
+        timestamp=book.timestamp,
     )
 
 

@@ -46,6 +46,7 @@ def _ensure_directories(settings: Settings) -> None:
         settings.storage.data_dir,
         settings.storage.market_snapshots_dir,
         settings.storage.price_data_dir,
+        settings.storage.orderbook_data_dir,
     ]
     for dir_path in dirs:
         Path(dir_path).mkdir(parents=True, exist_ok=True)
@@ -64,6 +65,8 @@ def _run_once(fetcher: DataFetcher, log: Any) -> FetchCycleResult:
         "cycle_complete",
         markets_found=result.markets_found,
         prices_stored=result.prices_stored,
+        prices_direct=result.prices_direct,
+        prices_midpoint=result.prices_midpoint,
         orderbooks_stored=result.orderbooks_stored,
         errors=result.errors,
     )
@@ -92,6 +95,8 @@ def _run_loop(
                 "cycle_complete",
                 markets_found=result.markets_found,
                 prices_stored=result.prices_stored,
+                prices_direct=result.prices_direct,
+                prices_midpoint=result.prices_midpoint,
                 orderbooks_stored=result.orderbooks_stored,
                 errors=result.errors,
             )
@@ -133,11 +138,18 @@ def main() -> None:
     )
 
     # 6. Build components explicitly — no DI framework
-    client = PolymarketHTTPClient(base_url=settings.polymarket.base_url)
+    #    gamma_client → discovery (Gamma API for event/market listing)
+    #    clob_client  → price_fetcher (CLOB API for orderbooks/prices)
+    gamma_client = PolymarketHTTPClient(base_url=settings.polymarket.gamma_base_url)
+    clob_client = PolymarketHTTPClient(base_url=settings.polymarket.base_url)
     try:
-        discovery = MarketDiscovery(client)
-        price_fetcher = PriceFetcher(client)
-        storage = DataStorage(base_dir=Path(settings.storage.data_dir))
+        discovery = MarketDiscovery(gamma_client)
+        price_fetcher = PriceFetcher(clob_client)
+        storage = DataStorage(
+            markets_dir=Path(settings.storage.market_snapshots_dir),
+            prices_dir=Path(settings.storage.price_data_dir),
+            orderbooks_dir=Path(settings.storage.orderbook_data_dir),
+        )
         fetcher = DataFetcher(discovery, price_fetcher, storage)
 
         log.info("components_ready")
@@ -156,7 +168,8 @@ def main() -> None:
         # Fallback: handles KeyboardInterrupt if signal handler was not reached
         pass
     finally:
-        client.close()
+        clob_client.close()
+        gamma_client.close()
         log.info("shutdown")
 
 

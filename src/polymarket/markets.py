@@ -1,26 +1,51 @@
 """
-Market discovery for BTC 15-minute Polymarket markets.
+Market discovery for BTC 15-minute Up/Down markets via Polymarket Gamma API.
 
-Responsibilities:
-  - Fetch markets from the Polymarket CLOB API via PolymarketHTTPClient
-  - Parse raw API responses into typed Market models
-  - Filter for active BTC 15-minute markets
+Discovery strategy (Phase 1):
+  1. Fetch open crypto events from Gamma /events endpoint (paginated to exhaustion)
+  2. Filter for Bitcoin Up or Down **15-minute** events using structured tags
+  3. Exclude expired markets (end_date <= now)
+  4. Extract markets from matching events
+  5. Parse JSON-encoded fields (clobTokenIds, outcomes)
+  6. Return enriched Market objects ready for CLOB price/orderbook fetching
+
+Granularity detection:
+  Gamma tags include a structured granularity label per event:
+    "5M"  → 5-minute markets
+    "15M" → 15-minute markets  ← Phase 1 target
+    "1H"  → hourly markets
+    "4h"  → 4-hour markets
+    "daily" → daily markets
+  The slug prefix also encodes granularity (e.g. "btc-updown-15m-*").
+
+Temporal semantics:
+  - ``eventStartTime`` (market-level): actual start of the 15-minute window.
+  - ``endDate``: end of the 15-minute window (= eventStartTime + 15 min).
+  - ``startDate``: market listing/creation timestamp — NOT the window start.
+
+Strike / price-to-beat (PTB):
+  NOT available from any Polymarket API (Gamma or CLOB).  BTC Up/Down
+  markets resolve based on the Chainlink BTC/USD oracle price at the
+  *start* vs. *end* of the window.  The PTB is a runtime oracle value
+  that must be captured from an external source at ``eventStartTime``.
+
+API notes:
+  - Discovery uses Gamma API (gamma-api.polymarket.com)
+  - Prices and orderbooks use CLOB API (clob.polymarket.com)
+  - Gamma returns clobTokenIds and outcomes as JSON *strings*
+  - BTC Up/Down events have outcomes ["Up", "Down"]
 
 Does NOT:
   - Fetch prices or orderbook data (that belongs in prices.py)
   - Contain strategy or execution logic
-
-API assumptions (Phase 1):
-  - GET /markets returns either a JSON list or {"data": [...], "next_cursor": "..."}
-  - Each market object contains: condition_id, question, tokens, active, closed,
-    end_date_iso (optional), group_id (optional), category (optional)
-  - Pagination is not chased automatically; caller can pass next_cursor as a param
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from src.polymarket.http_client import PolymarketHTTPClient
@@ -28,133 +53,324 @@ from src.polymarket.models import Market, Token
 
 log = logging.getLogger(__name__)
 
-MARKETS_ENDPOINT = "/markets"
+EVENTS_ENDPOINT = "/events"
 
-# Heuristic keywords for BTC market discovery (case-insensitive)
-_BTC_KEYWORDS: frozenset[str] = frozenset({"btc", "bitcoin"})
+# Safety limit for paginated event fetching.
+# If reached, the result is logged as potentially incomplete.
+_MAX_PAGES = 50
 
-# Matches a time-of-day like "12:00 PM", "3:15 AM", "9:45PM".
-# Polymarket BTC 15m markets embed a specific resolution time in the question.
-# Long-term BTC markets (e.g. "Will BTC reach $200k by 2026?") lack this pattern.
-_TIME_PATTERN: re.Pattern[str] = re.compile(r"\d{1,2}:\d{2}\s*[ap]m", re.IGNORECASE)
+# Phase 1 target granularity — only events tagged with this are retained.
+TARGET_GRANULARITY_TAG = "15M"
+
+
+# ---------------------------------------------------------------------------
+# Discovery statistics (for logging)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DiscoveryStats:
+    """Counters for granular discovery logging."""
+
+    total_crypto_events: int = 0
+    rejected_not_btc_updown: int = 0
+    rejected_wrong_granularity: int = 0
+    rejected_expired: int = 0
+    rejected_closed: int = 0
+    rejected_no_tokens: int = 0
+    rejected_parse_error: int = 0
+    retained: int = 0
+    pagination_exhausted: bool = True
+    granularity_breakdown: dict[str, int] = field(default_factory=dict)
 
 
 class MarketDiscovery:
     """
-    Discovers active BTC 15-minute markets on Polymarket.
-
-    Wraps PolymarketHTTPClient to fetch, parse, and filter markets.
+    Discovers active BTC 15-minute Up/Down markets on Polymarket via Gamma API.
 
     Usage::
 
-        discovery = MarketDiscovery(client)
+        gamma_client = PolymarketHTTPClient(base_url="https://gamma-api.polymarket.com")
+        discovery = MarketDiscovery(gamma_client)
         btc_markets = discovery.discover_btc_15m()
     """
 
     def __init__(self, client: PolymarketHTTPClient) -> None:
+        """
+        Args:
+            client: HTTP client configured for the **Gamma** API base URL.
+        """
         self._client = client
 
-    def fetch_markets(self, **params: Any) -> list[Market]:
+    def discover_btc_15m(self) -> list[Market]:
         """
-        Fetch one page of markets from the API and return typed Market models.
+        Discover active BTC 15-minute Up/Down markets from Gamma events.
 
-        Extra keyword arguments are forwarded as query parameters.
-        """
-        raw = self._client.get(MARKETS_ENDPOINT, params=params or None)
-        return _parse_markets(raw)
+        Applies the following filters in order:
+          1. Event title must contain "bitcoin" and "up or down"
+          2. Event tags must include "15M" (rejects 5M, 1H, 4h, daily)
+          3. Market end_date must be in the future
+          4. Market must not be closed and must have CLOB token IDs
 
-    def discover_btc_15m(self, **params: Any) -> list[Market]:
+        Returns enriched Market objects with slug, event_id, description, etc.
         """
-        Fetch markets and filter for active BTC 15-minute candidates.
+        now = datetime.now(tz=timezone.utc)
+        stats = DiscoveryStats()
 
-        Returns only markets where the question mentions BTC/Bitcoin
-        and the market is active and not closed.
+        events, stats.pagination_exhausted = self._fetch_crypto_events()
+        stats.total_crypto_events = len(events)
+
+        markets: list[Market] = []
+        for ev in events:
+            # --- Filter 1: Bitcoin Up or Down title ---
+            if not _is_btc_updown_event(ev):
+                stats.rejected_not_btc_updown += 1
+                continue
+
+            # --- Filter 2: 15M granularity tag ---
+            granularity = _extract_granularity_tag(ev)
+            if granularity:
+                stats.granularity_breakdown[granularity] = (
+                    stats.granularity_breakdown.get(granularity, 0) + 1
+                )
+            if granularity != TARGET_GRANULARITY_TAG:
+                stats.rejected_wrong_granularity += 1
+                log.debug(
+                    "Rejected event (granularity=%s): %s",
+                    granularity or "unknown",
+                    ev.get("title", "?"),
+                )
+                continue
+
+            ev_id = str(ev.get("id", ""))
+            ev_slug = ev.get("slug", "")
+
+            for raw_market in ev.get("markets", []):
+                try:
+                    m = _parse_gamma_market(raw_market, ev_id, ev_slug)
+                except Exception:
+                    slug = (
+                        raw_market.get("slug", "unknown")
+                        if isinstance(raw_market, dict)
+                        else "unknown"
+                    )
+                    log.warning("Skipping unparseable market: %s", slug)
+                    stats.rejected_parse_error += 1
+                    continue
+
+                # --- Filter 3: Expiry check ---
+                if m.end_date is not None and m.end_date <= now:
+                    stats.rejected_expired += 1
+                    log.debug(
+                        "Rejected expired market: %s (end_date=%s)",
+                        m.slug or m.question[:60],
+                        m.end_date.isoformat(),
+                    )
+                    continue
+
+                # --- Filter 4: Must be open with tokens ---
+                if m.closed:
+                    stats.rejected_closed += 1
+                    continue
+                if not m.tokens:
+                    stats.rejected_no_tokens += 1
+                    continue
+
+                markets.append(m)
+                log.debug(
+                    "Retained market: %s | tokens=%d | end=%s",
+                    m.slug or m.question[:60],
+                    len(m.tokens),
+                    m.end_date.isoformat() if m.end_date else "?",
+                )
+                for tok in m.tokens:
+                    log.debug(
+                        "  Token: %s -> %s",
+                        tok.outcome,
+                        tok.token_id[:24],
+                    )
+
+        stats.retained = len(markets)
+        _log_discovery_summary(stats)
+        return markets
+
+    def _fetch_crypto_events(self) -> tuple[list[dict[str, Any]], bool]:
         """
-        markets = self.fetch_markets(**params)
-        filtered = [m for m in markets if _is_btc_15m(m)]
+        Fetch all open crypto events from Gamma API with pagination.
+
+        Returns:
+            A tuple of (events_list, pagination_exhausted).
+            pagination_exhausted is True if all pages were fetched,
+            False if the safety limit was reached.
+        """
+        all_events: list[dict[str, Any]] = []
+        offset = 0
+        page_count = 0
+        exhausted = True
+
+        for _ in range(_MAX_PAGES):
+            batch = self._client.get(
+                EVENTS_ENDPOINT,
+                params={
+                    "tag_slug": "crypto",
+                    "closed": "false",
+                    "limit": "100",
+                    "offset": str(offset),
+                },
+            )
+            if not isinstance(batch, list) or not batch:
+                break
+            all_events.extend(batch)
+            offset += len(batch)
+            page_count += 1
+            if len(batch) < 100:
+                break
+        else:
+            # for-loop completed without break → safety limit reached
+            exhausted = False
+            log.warning(
+                "Pagination safety limit reached (%d pages, %d events). "
+                "Discovery result may be INCOMPLETE.",
+                _MAX_PAGES,
+                len(all_events),
+            )
+
         log.info(
-            "Discovered %d BTC 15m candidates out of %d markets",
-            len(filtered),
-            len(markets),
+            "Fetched %d crypto events in %d page(s) from Gamma /events "
+            "(exhausted=%s)",
+            len(all_events),
+            page_count,
+            exhausted,
         )
-        return filtered
+        return all_events, exhausted
 
 
 # ---------------------------------------------------------------------------
-# Parsing helpers
+# Event / market filter
 # ---------------------------------------------------------------------------
 
 
-def _parse_markets(raw: Any) -> list[Market]:
+def _is_btc_updown_event(event: dict[str, Any]) -> bool:
     """
-    Parse raw API response into a list of Market models.
+    Return True if *event* is a Bitcoin Up or Down event (any granularity).
 
-    Handles both flat list and paginated {"data": [...]} response shapes.
-    Skips individual markets that fail to parse (logs a warning, does not crash).
+    This is the first-pass title filter. Granularity filtering happens
+    separately via ``_extract_granularity_tag``.
     """
-    if isinstance(raw, dict):
-        items = raw.get("data", [])
-    elif isinstance(raw, list):
-        items = raw
-    else:
-        log.warning("Unexpected markets response type: %s", type(raw).__name__)
-        return []
+    title = (event.get("title") or "").lower()
+    return "bitcoin" in title and "up or down" in title
 
-    markets: list[Market] = []
-    for item in items:
+
+def _extract_granularity_tag(event: dict[str, Any]) -> str | None:
+    """
+    Extract the granularity tag from a Gamma event.
+
+    Known values: "5M", "15M", "1H", "4h", "daily".
+    Returns None if no recognized granularity tag is found.
+    """
+    known = {"5M", "15M", "1H", "4h", "daily"}
+    tags = event.get("tags", [])
+    for tag in tags:
+        slug = tag.get("slug", "") if isinstance(tag, dict) else str(tag)
+        if slug in known:
+            return slug
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Gamma market parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_json_string(value: Any, default: list[str]) -> list[str]:
+    """Parse a JSON-encoded string list, or return *default* on failure."""
+    if isinstance(value, str):
         try:
-            markets.append(_parse_single_market(item))
-        except Exception:
-            cid = item.get("condition_id", "unknown") if isinstance(item, dict) else "unknown"
-            log.warning("Skipping unparseable market: %s", cid)
-    return markets
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if isinstance(value, list):
+        return value
+    return default
 
 
-def _parse_single_market(raw: dict[str, Any]) -> Market:
+def _parse_gamma_market(
+    raw: dict[str, Any],
+    event_id: str = "",
+    event_slug: str = "",
+) -> Market:
     """
-    Parse a single raw market dict into a Market model.
+    Parse a Gamma API market dict into an enriched Market model.
 
-    Maps API field ``end_date_iso`` to model field ``end_date``.
+    Handles Gamma-specific field naming (camelCase) and JSON-encoded
+    string fields (clobTokenIds, outcomes).
+    Injects event-level context (event_id, event_slug) for traceability.
     """
-    tokens_raw: list[dict[str, Any]] = raw.get("tokens", [])
+    clob_ids = _parse_json_string(raw.get("clobTokenIds"), [])
+    outcomes = _parse_json_string(raw.get("outcomes"), [])
+
+    tokens = [
+        Token(
+            token_id=tid,
+            outcome=outcomes[i] if i < len(outcomes) else f"outcome_{i}",
+        )
+        for i, tid in enumerate(clob_ids)
+    ]
+
     return Market(
-        condition_id=raw["condition_id"],
-        question=raw["question"],
-        tokens=[Token(token_id=t["token_id"], outcome=t["outcome"]) for t in tokens_raw],
+        condition_id=raw.get("conditionId", ""),
+        question=raw.get("question", ""),
+        tokens=tokens,
         active=raw.get("active", False),
         closed=raw.get("closed", True),
-        end_date=raw.get("end_date_iso"),
-        group_id=raw.get("group_id"),
-        category=raw.get("category"),
+        end_date=raw.get("endDate"),
+        event_start_time=raw.get("eventStartTime"),
+        start_date=raw.get("startDate"),
+        group_id=raw.get("groupSlug"),
+        category=None,
+        slug=raw.get("slug"),
+        market_id=str(raw.get("id", "")),
+        event_id=event_id,
+        event_slug=event_slug,
+        description=raw.get("description"),
     )
 
 
 # ---------------------------------------------------------------------------
-# Filter helpers
+# Discovery logging
 # ---------------------------------------------------------------------------
 
 
-def _is_btc_15m(market: Market) -> bool:
-    """
-    Heuristic filter for BTC 15-minute market candidates.
-
-    A market passes if ALL of the following are true:
-      1. ``active is True`` and ``closed is False``
-      2. The question mentions "BTC" or "Bitcoin" (case-insensitive)
-      3. The question contains a time-of-day pattern (e.g. "12:15 PM")
-
-    Rule 3 separates short-duration (15m / hourly) BTC markets from
-    long-term markets like "Will BTC reach $200k by end of 2025?".
-
-    Limitations:
-      - Cannot distinguish 15-minute from hourly resolution solely from
-        a single question; true 15m identification requires cross-market
-        pattern analysis or group metadata (later phase).
-      - Relies on the question containing an ``H:MM AM/PM`` time string.
-    """
-    if not market.active or market.closed:
-        return False
-    q = market.question.lower()
-    has_btc = any(kw in q for kw in _BTC_KEYWORDS)
-    has_time = bool(_TIME_PATTERN.search(market.question))
-    return has_btc and has_time
+def _log_discovery_summary(stats: DiscoveryStats) -> None:
+    """Emit an INFO-level summary of discovery filtering results."""
+    log.info(
+        "Discovery summary: %d crypto events inspected, "
+        "%d retained (15M BTC Up/Down)",
+        stats.total_crypto_events,
+        stats.retained,
+    )
+    log.info(
+        "Rejections: not_btc_updown=%d, wrong_granularity=%d, "
+        "expired=%d, closed=%d, no_tokens=%d, parse_error=%d",
+        stats.rejected_not_btc_updown,
+        stats.rejected_wrong_granularity,
+        stats.rejected_expired,
+        stats.rejected_closed,
+        stats.rejected_no_tokens,
+        stats.rejected_parse_error,
+    )
+    if stats.granularity_breakdown:
+        breakdown = ", ".join(
+            f"{k}={v}" for k, v in sorted(stats.granularity_breakdown.items())
+        )
+        log.info("BTC Up/Down granularity breakdown: %s", breakdown)
+    if not stats.pagination_exhausted:
+        log.warning(
+            "Discovery may be INCOMPLETE — pagination safety limit reached"
+        )
+    log.info(
+        "PTB status: not available from Polymarket APIs — "
+        "requires external Chainlink BTC/USD oracle query at eventStartTime"
+    )

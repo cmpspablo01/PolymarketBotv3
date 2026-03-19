@@ -40,9 +40,13 @@ def _make_valid_raw() -> dict[str, Any]:
             "data_dir": "data",
             "market_snapshots_dir": "data/markets",
             "price_data_dir": "data/prices",
+            "orderbook_data_dir": "data/orderbooks",
         },
         "runner": {"heartbeat_interval_seconds": 60},
-        "polymarket": {"base_url": "https://clob.polymarket.com"},
+        "polymarket": {
+            "base_url": "https://clob.polymarket.com",
+            "gamma_base_url": "https://gamma-api.polymarket.com",
+        },
     }
 
 
@@ -82,6 +86,7 @@ def test_storage_fields(valid_config_file: Path) -> None:
     assert settings.storage.data_dir == "data"
     assert settings.storage.market_snapshots_dir == "data/markets"
     assert settings.storage.price_data_dir == "data/prices"
+    assert settings.storage.orderbook_data_dir == "data/orderbooks"
 
 
 def test_heartbeat_interval_is_int(valid_config_file: Path) -> None:

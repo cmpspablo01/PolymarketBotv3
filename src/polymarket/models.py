@@ -30,7 +30,24 @@ class Token(BaseModel):
 
 
 class Market(BaseModel):
-    """A Polymarket prediction market as returned by the CLOB API."""
+    """A Polymarket prediction market discovered via the Gamma API.
+
+    Temporal fields:
+      - ``event_start_time``: The actual start of the 15-minute trading window
+        (Gamma field ``eventStartTime``). For a market titled
+        "Bitcoin Up or Down - March 18, 8:45PM-9:00PM ET",
+        this would be ``2026-03-19T00:45:00Z``.
+      - ``end_date``: End of the 15-minute window (= event_start_time + 15 min).
+      - ``start_date``: Market *listing/creation* timestamp on Polymarket.
+        NOT the window start — typically ~24 h before ``event_start_time``.
+
+    PTB (price to beat):
+      Not available from Polymarket APIs.  BTC Up/Down markets resolve based
+      on the Chainlink BTC/USD oracle price at ``event_start_time`` vs the
+      oracle price at ``end_date``.  The opening BTC price (PTB) is a
+      runtime value that must be captured from an external oracle at the
+      exact moment the window opens.
+    """
 
     condition_id: str
     question: str
@@ -38,8 +55,15 @@ class Market(BaseModel):
     active: bool
     closed: bool
     end_date: datetime | None = None
+    event_start_time: datetime | None = None
+    start_date: datetime | None = None
     group_id: str | None = None
     category: str | None = None
+    slug: str | None = None
+    market_id: str | None = None
+    event_id: str | None = None
+    event_slug: str | None = None
+    description: str | None = None
 
 
 class TokenPrice(BaseModel):

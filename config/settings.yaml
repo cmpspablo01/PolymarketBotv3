@@ -11,8 +11,9 @@ logging:
 
 storage:
   data_dir: data
-  market_snapshots_dir: data/markets   # discovered market metadata
-  price_data_dir: data/prices          # price and orderbook snapshots
+  market_snapshots_dir: data/markets       # discovered market metadata
+  price_data_dir: data/prices              # price snapshots (JSONL)
+  orderbook_data_dir: data/orderbooks      # orderbook snapshots (JSONL)
 
 runner:
   heartbeat_interval_seconds: 60
@@ -20,3 +21,4 @@ runner:
 
 polymarket:
   base_url: https://clob.polymarket.com
+  gamma_base_url: https://gamma-api.polymarket.com

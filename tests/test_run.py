@@ -63,9 +63,13 @@ def _test_settings(tmp_path: Path, mode: str = "once") -> Settings:
             data_dir=str(tmp_path / "data"),
             market_snapshots_dir=str(tmp_path / "data" / "markets"),
             price_data_dir=str(tmp_path / "data" / "prices"),
+            orderbook_data_dir=str(tmp_path / "data" / "orderbooks"),
         ),
         runner=RunnerConfig(heartbeat_interval_seconds=1, mode=mode),
-        polymarket=PolymarketConfig(base_url="https://clob.polymarket.com"),
+        polymarket=PolymarketConfig(
+            base_url="https://clob.polymarket.com",
+            gamma_base_url="https://gamma-api.polymarket.com",
+        ),
     )
 
 
@@ -206,19 +210,22 @@ def test_main_config_failure_exits() -> None:
         assert exc_info.value.code == 1
 
 
-def test_main_once_mode_wires_and_closes_client(tmp_path: Path) -> None:
-    """Verify: builds all components, runs one cycle, closes client."""
+def test_main_once_mode_wires_and_closes_clients(tmp_path: Path) -> None:
+    """Verify: builds all components with dual clients, runs one cycle, closes both."""
     settings = _test_settings(tmp_path, mode="once")
 
-    mock_client = MagicMock()
+    mock_gamma_client = MagicMock(name="gamma_client")
+    mock_clob_client = MagicMock(name="clob_client")
     mock_fetcher_inst = MagicMock(spec=DataFetcher)
     mock_fetcher_inst.run_cycle.return_value = FetchCycleResult()
 
+    # PolymarketHTTPClient is called twice: first for gamma, then for clob
     with (
         patch("src.run.load_config", return_value=settings),
         patch("src.run.setup_logging"),
         patch(
-            "src.run.PolymarketHTTPClient", return_value=mock_client,
+            "src.run.PolymarketHTTPClient",
+            side_effect=[mock_gamma_client, mock_clob_client],
         ) as mock_client_cls,
         patch("src.run.MarketDiscovery") as mock_disc_cls,
         patch("src.run.PriceFetcher") as mock_pf_cls,
@@ -231,38 +238,45 @@ def test_main_once_mode_wires_and_closes_client(tmp_path: Path) -> None:
 
         main()
 
-    # Wiring assertions
-    mock_client_cls.assert_called_once_with(
-        base_url="https://clob.polymarket.com",
-    )
-    mock_disc_cls.assert_called_once_with(mock_client)
-    mock_pf_cls.assert_called_once_with(mock_client)
+    # Wiring: two clients created
+    assert mock_client_cls.call_count == 2
+    mock_client_cls.assert_any_call(base_url="https://gamma-api.polymarket.com")
+    mock_client_cls.assert_any_call(base_url="https://clob.polymarket.com")
+
+    # Discovery uses gamma, PriceFetcher uses clob
+    mock_disc_cls.assert_called_once_with(mock_gamma_client)
+    mock_pf_cls.assert_called_once_with(mock_clob_client)
     mock_storage_cls.assert_called_once()
     mock_fetcher_cls.assert_called_once()
 
     # Cycle ran exactly once
     mock_fetcher_inst.run_cycle.assert_called_once()
 
-    # Client closed on exit
-    mock_client.close.assert_called_once()
+    # Both clients closed on exit
+    mock_clob_client.close.assert_called_once()
+    mock_gamma_client.close.assert_called_once()
 
 
 def test_main_loop_mode_exits_on_shutdown(tmp_path: Path) -> None:
-    """Loop mode with pre-set shutdown event exits immediately; client closed."""
+    """Loop mode with pre-set shutdown event exits immediately; both clients closed."""
     import src.run
 
     src.run._shutdown_event.set()
 
     settings = _test_settings(tmp_path, mode="loop")
 
-    mock_client = MagicMock()
+    mock_gamma_client = MagicMock(name="gamma_client")
+    mock_clob_client = MagicMock(name="clob_client")
     mock_fetcher_inst = MagicMock(spec=DataFetcher)
     mock_fetcher_inst.run_cycle.return_value = FetchCycleResult()
 
     with (
         patch("src.run.load_config", return_value=settings),
         patch("src.run.setup_logging"),
-        patch("src.run.PolymarketHTTPClient", return_value=mock_client),
+        patch(
+            "src.run.PolymarketHTTPClient",
+            side_effect=[mock_gamma_client, mock_clob_client],
+        ),
         patch("src.run.MarketDiscovery"),
         patch("src.run.PriceFetcher"),
         patch("src.run.DataStorage"),
@@ -275,5 +289,6 @@ def test_main_loop_mode_exits_on_shutdown(tmp_path: Path) -> None:
     # Loop exited immediately — no cycles ran
     mock_fetcher_inst.run_cycle.assert_not_called()
 
-    # Client still closed
-    mock_client.close.assert_called_once()
+    # Both clients still closed
+    mock_clob_client.close.assert_called_once()
+    mock_gamma_client.close.assert_called_once()

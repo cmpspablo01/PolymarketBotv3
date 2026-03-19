@@ -22,6 +22,7 @@ ENV/
 # Runtime output — generated at runtime, not source
 logs/
 /data/
+scripts/api_probe*.py
 
 # Tool caches
 .mypy_cache/
