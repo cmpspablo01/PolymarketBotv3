@@ -7,7 +7,7 @@ Coverage:
   - empty markets       : no price fetches, no snapshot saved
   - partial failures    : price failure (with midpoint fallback), orderbook failure,
                           discovery failure, snapshot storage failure
-  - price fallback      : /price fails → midpoint derived from orderbook
+  - price fallback      : /midpoint fails → midpoint derived from orderbook
   - isolation           : orderbook failure does not block price attempt
   - traceability        : context dict passed to storage with condition_id, slug, etc.
   - price source        : prices_direct vs prices_midpoint counters
@@ -228,7 +228,7 @@ def test_empty_markets_no_further_calls() -> None:
 
 
 def test_price_failure_falls_back_to_book_midpoint() -> None:
-    """When /price fails, price should be derived from orderbook midpoint."""
+    """When /midpoint fails, price should be derived from orderbook midpoint."""
     m = _market("c1", n_tokens=1)
     fetcher, _, _, storage = _build(
         markets=[m],
@@ -249,7 +249,7 @@ def test_price_failure_falls_back_to_book_midpoint() -> None:
 
 
 def test_price_failure_no_fallback_when_book_also_fails() -> None:
-    """When both /price and /book fail, errors are counted for both."""
+    """When both /midpoint and /book fail, errors are counted for both."""
     m = _market("c1", n_tokens=1)
     fetcher, _, _, storage = _build(
         markets=[m],
@@ -283,7 +283,7 @@ def test_orderbook_failure_continues_to_next_token() -> None:
 
 
 def test_orderbook_failure_does_not_block_price() -> None:
-    """If orderbook fails, direct /price is still attempted."""
+    """If orderbook fails, direct /midpoint is still attempted."""
     m = _market("c1", n_tokens=1)
     fetcher, _, _, storage = _build(
         markets=[m],
@@ -293,7 +293,7 @@ def test_orderbook_failure_does_not_block_price() -> None:
     result = fetcher.run_cycle()
 
     assert result.orderbooks_stored == 0
-    assert result.prices_stored == 1  # direct /price still works
+    assert result.prices_stored == 1  # direct /midpoint still works
     assert result.prices_direct == 1
     assert result.errors >= 1
     storage.append_price.assert_called_once()

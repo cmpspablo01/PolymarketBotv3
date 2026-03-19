@@ -125,7 +125,7 @@ def midpoint_from_book(book: Orderbook) -> TokenPrice | None:
     Derive a mid-price from the best bid/ask of an orderbook.
 
     Returns None if the book has no bids or no asks.
-    Used as a fallback when the /price endpoint fails (e.g. neg-risk markets).
+    Used as a fallback when the /midpoint endpoint fails.
     """
     if not book.bids or not book.asks:
         return None
@@ -144,7 +144,7 @@ def _parse_orderbook(token_id: str, raw: Any) -> Orderbook:
     Parse raw orderbook API response into an Orderbook model.
 
     Handles string-to-float coercion for price and size values.
-    Applies the same timestamp priority as ``_parse_price``:
+    Applies the same timestamp priority as ``_parse_midpoint``:
     API ``timestamp`` first, ``datetime.now(UTC)`` fallback.
     """
     if not isinstance(raw, dict):

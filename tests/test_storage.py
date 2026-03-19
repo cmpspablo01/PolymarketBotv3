@@ -76,6 +76,8 @@ def _make_orderbook(**overrides: object) -> Orderbook:
 
 
 SNAPSHOT_TS = datetime(2025, 3, 18, 16, 0, 0, tzinfo=timezone.utc)
+RUN_TS = datetime(2025, 3, 18, 16, 0, 0, tzinfo=timezone.utc)
+RUN_ID = "test-run-12345"
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +87,7 @@ SNAPSHOT_TS = datetime(2025, 3, 18, 16, 0, 0, tzinfo=timezone.utc)
 
 def test_snapshot_creates_json_file(tmp_path: Path) -> None:
     s = _storage(tmp_path)
-    path = s.save_market_snapshot([_make_market()], SNAPSHOT_TS)
+    path = s.save_market_snapshot([_make_market()], SNAPSHOT_TS, run_id=RUN_ID)
 
     assert path.exists()
     assert path.suffix == ".json"
@@ -94,11 +96,13 @@ def test_snapshot_creates_json_file(tmp_path: Path) -> None:
 
 def test_snapshot_envelope_structure(tmp_path: Path) -> None:
     s = _storage(tmp_path)
-    path = s.save_market_snapshot([_make_market()], SNAPSHOT_TS)
+    path = s.save_market_snapshot([_make_market()], SNAPSHOT_TS, run_id=RUN_ID)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert "snapshot_ts" in data
     assert data["snapshot_ts"] == SNAPSHOT_TS.isoformat()
+    assert "run_id" in data
+    assert data["run_id"] == RUN_ID
     assert "markets" in data
     assert isinstance(data["markets"], list)
     assert len(data["markets"]) == 1
@@ -109,7 +113,7 @@ def test_snapshot_preserves_end_date(tmp_path: Path) -> None:
     market = _make_market(end_date=end)
     s = _storage(tmp_path)
 
-    path = s.save_market_snapshot([market], SNAPSHOT_TS)
+    path = s.save_market_snapshot([market], SNAPSHOT_TS, run_id=RUN_ID)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["markets"][0]["end_date"] is not None
@@ -127,7 +131,7 @@ def test_snapshot_preserves_enriched_metadata(tmp_path: Path) -> None:
         market_id="55555",
     )
     s = _storage(tmp_path)
-    path = s.save_market_snapshot([market], SNAPSHOT_TS)
+    path = s.save_market_snapshot([market], SNAPSHOT_TS, run_id=RUN_ID)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     m = data["markets"][0]
@@ -143,7 +147,7 @@ def test_snapshot_preserves_enriched_metadata(tmp_path: Path) -> None:
 
 def test_snapshot_empty_market_list(tmp_path: Path) -> None:
     s = _storage(tmp_path)
-    path = s.save_market_snapshot([], SNAPSHOT_TS)
+    path = s.save_market_snapshot([], SNAPSHOT_TS, run_id=RUN_ID)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["markets"] == []
@@ -157,10 +161,19 @@ def test_snapshot_creates_directories(tmp_path: Path) -> None:
         orderbooks_dir=nested / "orderbooks",
     )
 
-    path = s.save_market_snapshot([], SNAPSHOT_TS)
+    path = s.save_market_snapshot([], SNAPSHOT_TS, run_id=RUN_ID)
 
     assert path.exists()
     assert (nested / "markets").is_dir()
+
+
+def test_snapshot_includes_run_id(tmp_path: Path) -> None:
+    s = _storage(tmp_path)
+    path = s.save_market_snapshot([_make_market()], SNAPSHOT_TS, run_id=RUN_ID)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "run_id" in data
+    assert data["run_id"] == RUN_ID
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +183,7 @@ def test_snapshot_creates_directories(tmp_path: Path) -> None:
 
 def test_price_creates_jsonl_file(tmp_path: Path) -> None:
     s = _storage(tmp_path)
-    path = s.append_price(_make_price())
+    path = s.append_price(_make_price(), RUN_TS, RUN_ID)
 
     assert path.exists()
     assert path.suffix == ".jsonl"
@@ -181,7 +194,7 @@ def test_price_preserves_api_timestamp(tmp_path: Path) -> None:
     api_ts = datetime(2025, 3, 18, 16, 0, 0, tzinfo=timezone.utc)
     s = _storage(tmp_path)
 
-    path = s.append_price(_make_price(timestamp=api_ts))
+    path = s.append_price(_make_price(timestamp=api_ts), RUN_TS, RUN_ID)
 
     record = json.loads(path.read_text(encoding="utf-8").strip())
     assert "timestamp" in record
@@ -190,17 +203,19 @@ def test_price_preserves_api_timestamp(tmp_path: Path) -> None:
 
 def test_price_includes_written_at(tmp_path: Path) -> None:
     s = _storage(tmp_path)
-    path = s.append_price(_make_price())
+    path = s.append_price(_make_price(), RUN_TS, RUN_ID)
 
     record = json.loads(path.read_text(encoding="utf-8").strip())
     assert "written_at" in record
+    assert "run_id" in record
+    assert record["run_id"] == RUN_ID
 
 
 def test_price_written_at_differs_from_api_timestamp(
     tmp_path: Path,
 ) -> None:
     s = _storage(tmp_path)
-    path = s.append_price(_make_price())
+    path = s.append_price(_make_price(), RUN_TS, RUN_ID)
 
     record = json.loads(path.read_text(encoding="utf-8").strip())
     assert "timestamp" in record
@@ -210,8 +225,8 @@ def test_price_written_at_differs_from_api_timestamp(
 
 def test_price_appends_to_existing_file(tmp_path: Path) -> None:
     s = _storage(tmp_path)
-    s.append_price(_make_price(token_id="tok_a"))
-    path = s.append_price(_make_price(token_id="tok_b"))
+    s.append_price(_make_price(token_id="tok_a"), RUN_TS, RUN_ID)
+    path = s.append_price(_make_price(token_id="tok_b"), RUN_TS, RUN_ID)
 
     lines = path.read_text(encoding="utf-8").strip().split("\n")
     assert len(lines) == 2
@@ -227,7 +242,7 @@ def test_price_creates_directories(tmp_path: Path) -> None:
         orderbooks_dir=nested / "orderbooks",
     )
 
-    path = s.append_price(_make_price())
+    path = s.append_price(_make_price(), RUN_TS, RUN_ID)
     assert path.exists()
 
 
@@ -240,7 +255,7 @@ def test_price_context_merged_into_record(tmp_path: Path) -> None:
         "market_slug": "btc-updown-15m-123",
         "price_source": "midpoint",
     }
-    path = s.append_price(_make_price(), context=ctx)
+    path = s.append_price(_make_price(), RUN_TS, RUN_ID, context=ctx)
 
     record = json.loads(path.read_text(encoding="utf-8").strip())
     assert record["condition_id"] == "cond_001"
@@ -255,9 +270,8 @@ def test_price_context_merged_into_record(tmp_path: Path) -> None:
 
 
 def test_orderbook_creates_jsonl_file(tmp_path: Path) -> None:
-    api_ts = datetime(2025, 3, 18, 16, 0, 0, tzinfo=timezone.utc)
     s = _storage(tmp_path)
-    path = s.append_orderbook(_make_orderbook(timestamp=api_ts))
+    path = s.append_orderbook(_make_orderbook(), RUN_TS, RUN_ID)
 
     assert path.exists()
     assert path.suffix == ".jsonl"
@@ -265,15 +279,17 @@ def test_orderbook_creates_jsonl_file(tmp_path: Path) -> None:
 
 def test_orderbook_includes_written_at(tmp_path: Path) -> None:
     s = _storage(tmp_path)
-    path = s.append_orderbook(_make_orderbook())
+    path = s.append_orderbook(_make_orderbook(), RUN_TS, RUN_ID)
 
     record = json.loads(path.read_text(encoding="utf-8").strip())
     assert "written_at" in record
+    assert "run_id" in record
+    assert record["run_id"] == RUN_ID
 
 
 def test_orderbook_preserves_bids_asks(tmp_path: Path) -> None:
     s = _storage(tmp_path)
-    path = s.append_orderbook(_make_orderbook())
+    path = s.append_orderbook(_make_orderbook(), RUN_TS, RUN_ID)
 
     record = json.loads(path.read_text(encoding="utf-8").strip())
     assert len(record["bids"]) == 1
@@ -290,18 +306,20 @@ def test_orderbook_creates_directories(tmp_path: Path) -> None:
         orderbooks_dir=nested / "orderbooks",
     )
 
-    path = s.append_orderbook(_make_orderbook())
+    path = s.append_orderbook(_make_orderbook(), RUN_TS, RUN_ID)
     assert path.exists()
 
 
-def test_orderbook_uses_api_timestamp_for_filename(
+def test_orderbook_filename_uses_run_ts(
     tmp_path: Path,
 ) -> None:
-    api_ts = datetime(2025, 3, 18, 16, 0, 0, tzinfo=timezone.utc)
+    """Filename is derived from run_ts, ensuring same-run grouping."""
+    api_ts = datetime(2025, 3, 19, 14, 30, 0, tzinfo=timezone.utc)
     s = _storage(tmp_path)
 
-    path = s.append_orderbook(_make_orderbook(timestamp=api_ts))
+    path = s.append_orderbook(_make_orderbook(timestamp=api_ts), RUN_TS, RUN_ID)
 
+    # Filename uses RUN_TS (2025-03-18), not api_ts (2025-03-19)
     assert "2025-03-18" in path.name
 
 
@@ -311,7 +329,7 @@ def test_orderbook_preserves_api_timestamp_in_record(
     api_ts = datetime(2025, 3, 18, 16, 0, 0, tzinfo=timezone.utc)
     s = _storage(tmp_path)
 
-    path = s.append_orderbook(_make_orderbook(timestamp=api_ts))
+    path = s.append_orderbook(_make_orderbook(timestamp=api_ts), RUN_TS, RUN_ID)
 
     record = json.loads(path.read_text(encoding="utf-8").strip())
     assert "timestamp" in record
@@ -329,7 +347,7 @@ def test_orderbook_context_merged_into_record(tmp_path: Path) -> None:
         "market_slug": "btc-updown-15m-456",
         "event_id": "99001",
     }
-    path = s.append_orderbook(_make_orderbook(), context=ctx)
+    path = s.append_orderbook(_make_orderbook(), RUN_TS, RUN_ID, context=ctx)
 
     record = json.loads(path.read_text(encoding="utf-8").strip())
     assert record["condition_id"] == "cond_001"

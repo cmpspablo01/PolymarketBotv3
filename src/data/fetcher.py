@@ -19,6 +19,7 @@ Does NOT:
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -66,9 +67,15 @@ class DataFetcher:
         """
         Run one discovery → orderbook/price → storage cycle.
 
+        Generates a unique run_id to link all artifacts (snapshot, prices,
+        orderbooks) produced during this cycle for traceability.
+
         Partial failures are logged and counted but never crash the cycle.
         Returns a :class:`FetchCycleResult` summarizing what happened.
         """
+        run_id = str(uuid.uuid4())
+        run_ts = datetime.now(tz=timezone.utc)
+        log.info("Starting cycle run_id=%s", run_id)
         result = FetchCycleResult()
 
         # --- 1. Discover markets ----------------------------------------
@@ -85,13 +92,14 @@ class DataFetcher:
             log.info("No BTC 15m markets found, cycle complete")
             return result
 
-        # --- 2. Save market snapshot ------------------------------------
-        snapshot_ts = datetime.now(tz=timezone.utc)
+        # --- 2. Save market snapshot        # Save snapshot
         try:
-            path = self._storage.save_market_snapshot(markets, snapshot_ts)
+            path = self._storage.save_market_snapshot(
+                markets, run_ts, run_id=run_id
+            )
             log.info("Market snapshot written: %s", path.name)
         except Exception as exc:
-            log.error("Market snapshot storage failed: %s", exc)
+            log.error("Failed to save market snapshot: %s", exc)
             result.errors += 1
             # Continue — prices/orderbooks are still valuable.
 
@@ -110,7 +118,9 @@ class DataFetcher:
                 book = None
                 try:
                     book = self._price_fetcher.fetch_orderbook(tid)
-                    self._storage.append_orderbook(book, context=tok_ctx)
+                    self._storage.append_orderbook(
+                        book, run_ts, run_id=run_id, context=tok_ctx
+                    )
                     result.orderbooks_stored += 1
                     log.debug("Orderbook stored for %s (%s)", tid[:24], token.outcome)
                 except Exception as exc:
@@ -120,11 +130,13 @@ class DataFetcher:
                     )
                     result.errors += 1
 
-                # Price: try /price endpoint first, fall back to book midpoint
+                # Price: fetch from /midpoint endpoint, fall back to book midpoint
                 try:
                     price = self._price_fetcher.fetch_price(tid)
                     self._storage.append_price(
                         price,
+                        run_ts,
+                        run_id=run_id,
                         context={**tok_ctx, "price_source": "direct"},
                     )
                     result.prices_stored += 1
@@ -142,6 +154,8 @@ class DataFetcher:
                             try:
                                 self._storage.append_price(
                                     fallback,
+                                    run_ts,
+                                    run_id=run_id,
                                     context={**tok_ctx, "price_source": "midpoint"},
                                 )
                                 result.prices_stored += 1

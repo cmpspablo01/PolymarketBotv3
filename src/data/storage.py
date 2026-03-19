@@ -59,9 +59,12 @@ class DataStorage:
             prices_dir=Path("data/prices"),
             orderbooks_dir=Path("data/orderbooks"),
         )
-        storage.save_market_snapshot(markets, snapshot_ts)
-        storage.append_price(price, context={...})
-        storage.append_orderbook(orderbook, context={...})
+        run_id = str(uuid.uuid4())
+        run_ts = datetime.now(tz=timezone.utc)
+        
+        storage.save_market_snapshot(markets, snapshot_ts, run_id=run_id)
+        storage.append_price(price, run_ts, run_id=run_id, context={...})
+        storage.append_orderbook(orderbook, run_ts, run_id=run_id, context={...})
     """
 
     def __init__(
@@ -82,15 +85,13 @@ class DataStorage:
         self,
         markets: list[Market],
         snapshot_ts: datetime,
+        run_id: str | None = None,
     ) -> Path:
         """
-        Write a JSON file containing the full market discovery snapshot.
+        Save a snapshot of discovered markets to a timestamped JSON file.
 
-        The envelope contains:
-          - ``snapshot_ts``: when the snapshot was taken (ISO 8601)
-          - ``markets``: list of market dicts with all fields preserved
-
-        Returns the path to the written file.
+        The snapshot includes the timestamp, run_id (for traceability), and
+        a list of markets. Returns the path to the created file.
         """
         self._markets_dir.mkdir(parents=True, exist_ok=True)
 
@@ -99,13 +100,14 @@ class DataStorage:
         ts_str = snapshot_ts.strftime("%Y%m%dT%H%M%S") + f"_{ms}Z"
         file_path = self._markets_dir / f"markets_{ts_str}.json"
 
-        payload: dict[str, Any] = {
+        envelope = {
             "snapshot_ts": snapshot_ts.isoformat(),
+            "run_id": run_id,
             "markets": [m.model_dump(mode="json") for m in markets],
         }
 
         file_path.write_text(
-            json.dumps(payload, indent=2), encoding="utf-8",
+            json.dumps(envelope, indent=2), encoding="utf-8",
         )
         log.info(
             "Saved market snapshot: %s (%d markets)",
@@ -121,14 +123,16 @@ class DataStorage:
     def append_price(
         self,
         price: TokenPrice,
+        run_ts: datetime,
+        run_id: str | None = None,
         context: dict[str, Any] | None = None,
     ) -> Path:
         """
         Append a single price record to the daily JSONL file.
 
-        The record preserves the API timestamp from ``TokenPrice.timestamp``
-        (source of truth).  A separate ``written_at`` field is added for
-        write-time auditing only.
+        Uses ``run_ts`` (cycle start time) for daily filename derivation
+        to ensure all records from the same run are grouped together.
+        Adds ``run_id`` and ``written_at`` fields for traceability.
 
         If *context* is provided, its key/value pairs are merged into the
         record (e.g. condition_id, outcome, slug for traceability).
@@ -137,23 +141,15 @@ class DataStorage:
         """
         self._prices_dir.mkdir(parents=True, exist_ok=True)
 
-        # Use the price's API timestamp for daily file naming.
-        if price.timestamp is not None:
-            ts = price.timestamp
-        else:
-            ts = datetime.now(tz=timezone.utc)
-            log.warning(
-                "Price for %s has no API timestamp; "
-                "using local UTC for filename",
-                price.token_id,
-            )
-        date_str = ts.strftime("%Y-%m-%d")
+        # Use run_ts for consistent daily file naming across the run.
+        date_str = run_ts.strftime("%Y-%m-%d")
         file_path = self._prices_dir / f"prices_{date_str}.jsonl"
 
         record = price.model_dump(mode="json")
+        record["run_id"] = run_id
+        record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
         if context:
             record.update(context)
-        record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
 
         with file_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
@@ -167,16 +163,16 @@ class DataStorage:
     def append_orderbook(
         self,
         orderbook: Orderbook,
+        run_ts: datetime,
+        run_id: str | None = None,
         context: dict[str, Any] | None = None,
     ) -> Path:
         """
         Append a single orderbook record to the daily JSONL file.
 
-        Uses the API timestamp from ``Orderbook.timestamp`` as the
-        source-of-truth for daily filename derivation.  Falls back to
-        local UTC only when the API timestamp is absent (and logs a
-        warning).  A ``written_at`` field is added for write-time
-        auditing only.
+        Uses ``run_ts`` (cycle start time) for daily filename derivation
+        to ensure all records from the same run are grouped together.
+        Adds ``run_id`` and ``written_at`` fields for traceability.
 
         If *context* is provided, its key/value pairs are merged into the
         record (e.g. condition_id, outcome, slug for traceability).
@@ -185,23 +181,15 @@ class DataStorage:
         """
         self._orderbooks_dir.mkdir(parents=True, exist_ok=True)
 
-        # Use the orderbook's API timestamp for daily file naming.
-        if orderbook.timestamp is not None:
-            ts = orderbook.timestamp
-        else:
-            ts = datetime.now(tz=timezone.utc)
-            log.warning(
-                "Orderbook for %s has no API timestamp; "
-                "using local UTC for filename",
-                orderbook.token_id,
-            )
-        date_str = ts.strftime("%Y-%m-%d")
+        # Use run_ts for consistent daily file naming across the run.
+        date_str = run_ts.strftime("%Y-%m-%d")
         file_path = self._orderbooks_dir / f"orderbooks_{date_str}.jsonl"
 
         record = orderbook.model_dump(mode="json")
+        record["run_id"] = run_id
+        record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
         if context:
             record.update(context)
-        record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
 
         with file_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
