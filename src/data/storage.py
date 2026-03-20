@@ -1,10 +1,11 @@
 """
-Raw data persistence for Polymarket research data.
+Raw data persistence for Polymarket and external-source research data.
 
 Responsibilities:
   - Write market discovery snapshots as JSON files
   - Append price records to daily JSONL files (with traceability context)
   - Append orderbook records to daily JSONL files (with traceability context)
+  - Append external-source ticks (Binance spot, reference price) to daily JSONL
   - Create directories as needed
 
 File layout::
@@ -15,17 +16,29 @@ File layout::
         prices_2025-03-18.jsonl         — one line per price record, daily rolling
     {orderbooks_dir}/
         orderbooks_2025-03-18.jsonl     — one line per orderbook record, daily
+    {binance_spot_dir}/
+        binance_spot_2025-03-18.jsonl   — one line per Binance spot tick, daily
+    {reference_price_dir}/
+        reference_price_2025-03-18.jsonl — one line per reference price tick, daily
 
 Directory paths are provided explicitly by the caller (from config).
 
 Timestamp policy:
-  - API timestamps are preserved as-is in record content (source of truth).
+  - API/source timestamps are preserved as-is in record content (source of truth).
   - A ``written_at`` field is added to JSONL records for write-time auditing.
-    It is clearly labeled and never confused with API/event timestamps.
+    It is clearly labeled and never confused with API/source/exchange timestamps.
   - Market snapshot filenames use the caller-provided snapshot timestamp.
   - Price JSONL filenames use the date from the record's own API timestamp.
   - Orderbook JSONL filenames use the date from the record's API timestamp.
+  - External-source JSONL filenames use the date from caller-provided ``run_ts``.
   - If any API timestamp is missing, a local UTC fallback is used and logged.
+
+External-source storage:
+  - BinanceSpotTick and ReferencePriceTick are serialized via ``model_dump``
+    with all provenance fields preserved (exchange_timestamp, source_timestamp,
+    local_receive_timestamp, processed_timestamp, source, is_proxy, etc.).
+  - ``written_at`` is the only field added by the storage layer.
+  - No fields are renamed, dropped, or wrapped during serialization.
 
 Traceability:
   - ``append_price`` and ``append_orderbook`` accept an optional *context*
@@ -43,6 +56,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.external.models import BinanceSpotTick, ReferencePriceTick
 from src.polymarket.models import Market, Orderbook, TokenPrice
 
 log = logging.getLogger(__name__)
@@ -50,7 +64,7 @@ log = logging.getLogger(__name__)
 
 class DataStorage:
     """
-    Persists raw Polymarket data to local files.
+    Persists raw Polymarket and external-source data to local files.
 
     Usage::
 
@@ -58,13 +72,17 @@ class DataStorage:
             markets_dir=Path("data/markets"),
             prices_dir=Path("data/prices"),
             orderbooks_dir=Path("data/orderbooks"),
+            binance_spot_dir=Path("data/binance_spot"),
+            reference_price_dir=Path("data/reference_price"),
         )
         run_id = str(uuid.uuid4())
         run_ts = datetime.now(tz=timezone.utc)
-        
+
         storage.save_market_snapshot(markets, snapshot_ts, run_id=run_id)
         storage.append_price(price, run_ts, run_id=run_id, context={...})
         storage.append_orderbook(orderbook, run_ts, run_id=run_id, context={...})
+        storage.append_binance_spot_tick(tick, run_ts)
+        storage.append_reference_price_tick(tick, run_ts)
     """
 
     def __init__(
@@ -72,10 +90,14 @@ class DataStorage:
         markets_dir: Path,
         prices_dir: Path,
         orderbooks_dir: Path,
+        binance_spot_dir: Path | None = None,
+        reference_price_dir: Path | None = None,
     ) -> None:
         self._markets_dir = markets_dir
         self._prices_dir = prices_dir
         self._orderbooks_dir = orderbooks_dir
+        self._binance_spot_dir = binance_spot_dir
+        self._reference_price_dir = reference_price_dir
 
     # ------------------------------------------------------------------
     # Market snapshots (JSON)
@@ -190,6 +212,87 @@ class DataStorage:
         record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
         if context:
             record.update(context)
+
+        with file_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        return file_path
+
+    # ------------------------------------------------------------------
+    # Binance spot ticks (JSONL)
+    # ------------------------------------------------------------------
+
+    def append_binance_spot_tick(
+        self,
+        tick: BinanceSpotTick,
+        run_ts: datetime,
+    ) -> Path:
+        """
+        Append a single Binance spot tick to the daily JSONL file.
+
+        Uses ``run_ts`` for daily filename derivation (consistent with
+        Polymarket storage).  All model fields are preserved via
+        ``model_dump``.  A ``written_at`` field is added for write-time
+        auditing — it is clearly separate from exchange/local timestamps.
+
+        Returns the path to the JSONL file.
+
+        Raises:
+            ValueError: If ``binance_spot_dir`` was not configured.
+        """
+        if self._binance_spot_dir is None:
+            raise ValueError(
+                "binance_spot_dir was not configured on this DataStorage instance"
+            )
+
+        self._binance_spot_dir.mkdir(parents=True, exist_ok=True)
+
+        date_str = run_ts.strftime("%Y-%m-%d")
+        file_path = self._binance_spot_dir / f"binance_spot_{date_str}.jsonl"
+
+        record = tick.model_dump(mode="json")
+        record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
+
+        with file_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        return file_path
+
+    # ------------------------------------------------------------------
+    # Reference price ticks (JSONL)
+    # ------------------------------------------------------------------
+
+    def append_reference_price_tick(
+        self,
+        tick: ReferencePriceTick,
+        run_ts: datetime,
+    ) -> Path:
+        """
+        Append a single reference-price tick to the daily JSONL file.
+
+        Uses ``run_ts`` for daily filename derivation.  All model fields
+        are preserved via ``model_dump``, including proxy metadata
+        (``is_proxy``, ``proxy_description``, ``source``).  A
+        ``written_at`` field is added for write-time auditing — it is
+        clearly separate from source/local timestamps.
+
+        Returns the path to the JSONL file.
+
+        Raises:
+            ValueError: If ``reference_price_dir`` was not configured.
+        """
+        if self._reference_price_dir is None:
+            raise ValueError(
+                "reference_price_dir was not configured on this DataStorage instance"
+            )
+
+        self._reference_price_dir.mkdir(parents=True, exist_ok=True)
+
+        date_str = run_ts.strftime("%Y-%m-%d")
+        file_path = self._reference_price_dir / f"reference_price_{date_str}.jsonl"
+
+        record = tick.model_dump(mode="json")
+        record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
 
         with file_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
