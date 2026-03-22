@@ -14,6 +14,8 @@ storage:
   market_snapshots_dir: data/markets       # discovered market metadata
   price_data_dir: data/prices              # price snapshots (JSONL)
   orderbook_data_dir: data/orderbooks      # orderbook snapshots (JSONL)
+  binance_spot_data_dir: data/binance_spot           # Binance spot ticks (JSONL)
+  reference_price_data_dir: data/reference_price     # reference price ticks (JSONL)
 
 runner:
   heartbeat_interval_seconds: 60

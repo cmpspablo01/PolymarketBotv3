@@ -26,6 +26,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from src.data.storage import DataStorage
 from src.external.models import BinanceSpotTick, ReferencePriceTick
 from src.polymarket.models import (
@@ -589,3 +591,108 @@ def test_reference_price_raw_payload_preserved(tmp_path: Path) -> None:
 
     record = json.loads(path.read_text(encoding="utf-8").strip())
     assert record["raw_payload"] == payload
+
+
+# ---------------------------------------------------------------------------
+# run_id traceability on external records
+# ---------------------------------------------------------------------------
+
+
+def test_binance_spot_run_id_persisted(tmp_path: Path) -> None:
+    """run_id should be stored in the Binance spot JSONL record."""
+    s = _ext_storage(tmp_path)
+    path = s.append_binance_spot_tick(
+        _make_binance_tick(), EXT_RUN_TS, run_id="cycle-abc-123"
+    )
+
+    record = json.loads(path.read_text(encoding="utf-8").strip())
+    assert record["run_id"] == "cycle-abc-123"
+
+
+def test_binance_spot_run_id_none_when_omitted(tmp_path: Path) -> None:
+    s = _ext_storage(tmp_path)
+    path = s.append_binance_spot_tick(_make_binance_tick(), EXT_RUN_TS)
+
+    record = json.loads(path.read_text(encoding="utf-8").strip())
+    assert record["run_id"] is None
+
+
+def test_reference_price_run_id_persisted(tmp_path: Path) -> None:
+    """run_id should be stored in the reference price JSONL record."""
+    s = _ext_storage(tmp_path)
+    path = s.append_reference_price_tick(
+        _make_reference_tick(), EXT_RUN_TS, run_id="cycle-abc-123"
+    )
+
+    record = json.loads(path.read_text(encoding="utf-8").strip())
+    assert record["run_id"] == "cycle-abc-123"
+
+
+def test_reference_price_run_id_none_when_omitted(tmp_path: Path) -> None:
+    s = _ext_storage(tmp_path)
+    path = s.append_reference_price_tick(_make_reference_tick(), EXT_RUN_TS)
+
+    record = json.loads(path.read_text(encoding="utf-8").strip())
+    assert record["run_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Filename derivation uses run_ts, not source/exchange timestamps
+# ---------------------------------------------------------------------------
+
+
+def test_binance_spot_filename_uses_run_ts_not_exchange(tmp_path: Path) -> None:
+    """Filename date should come from run_ts, not exchange_timestamp."""
+    s = _ext_storage(tmp_path)
+    tick = _make_binance_tick(
+        exchange_timestamp=datetime(2026, 3, 18, 23, 59, 59, tzinfo=timezone.utc),
+    )
+    run_ts = datetime(2026, 3, 19, 0, 0, 1, tzinfo=timezone.utc)
+
+    path = s.append_binance_spot_tick(tick, run_ts)
+
+    assert "2026-03-19" in path.name
+    assert "2026-03-18" not in path.name
+
+
+def test_reference_price_filename_uses_run_ts_not_source(tmp_path: Path) -> None:
+    """Filename date should come from run_ts, not source_timestamp."""
+    s = _ext_storage(tmp_path)
+    tick = _make_reference_tick(
+        source_timestamp=datetime(2026, 3, 18, 23, 59, 59, tzinfo=timezone.utc),
+    )
+    run_ts = datetime(2026, 3, 19, 0, 0, 1, tzinfo=timezone.utc)
+
+    path = s.append_reference_price_tick(tick, run_ts)
+
+    assert "2026-03-19" in path.name
+    assert "2026-03-18" not in path.name
+
+
+# ---------------------------------------------------------------------------
+# Missing external dir raises ValueError
+# ---------------------------------------------------------------------------
+
+
+def test_binance_spot_raises_when_dir_not_configured(tmp_path: Path) -> None:
+    """append_binance_spot_tick must fail if binance_spot_dir was not set."""
+    s = DataStorage(
+        markets_dir=tmp_path / "markets",
+        prices_dir=tmp_path / "prices",
+        orderbooks_dir=tmp_path / "orderbooks",
+        # binance_spot_dir intentionally omitted
+    )
+    with pytest.raises(ValueError, match="binance_spot_dir was not configured"):
+        s.append_binance_spot_tick(_make_binance_tick(), EXT_RUN_TS)
+
+
+def test_reference_price_raises_when_dir_not_configured(tmp_path: Path) -> None:
+    """append_reference_price_tick must fail if reference_price_dir was not set."""
+    s = DataStorage(
+        markets_dir=tmp_path / "markets",
+        prices_dir=tmp_path / "prices",
+        orderbooks_dir=tmp_path / "orderbooks",
+        # reference_price_dir intentionally omitted
+    )
+    with pytest.raises(ValueError, match="reference_price_dir was not configured"):
+        s.append_reference_price_tick(_make_reference_tick(), EXT_RUN_TS)

@@ -41,6 +41,8 @@ def _make_valid_raw() -> dict[str, Any]:
             "market_snapshots_dir": "data/markets",
             "price_data_dir": "data/prices",
             "orderbook_data_dir": "data/orderbooks",
+            "binance_spot_data_dir": "data/binance_spot",
+            "reference_price_data_dir": "data/reference_price",
         },
         "runner": {"heartbeat_interval_seconds": 60},
         "polymarket": {
@@ -87,6 +89,8 @@ def test_storage_fields(valid_config_file: Path) -> None:
     assert settings.storage.market_snapshots_dir == "data/markets"
     assert settings.storage.price_data_dir == "data/prices"
     assert settings.storage.orderbook_data_dir == "data/orderbooks"
+    assert settings.storage.binance_spot_data_dir == "data/binance_spot"
+    assert settings.storage.reference_price_data_dir == "data/reference_price"
 
 
 def test_heartbeat_interval_is_int(valid_config_file: Path) -> None:

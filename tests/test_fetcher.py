@@ -11,6 +11,8 @@ Coverage:
   - isolation           : orderbook failure does not block price attempt
   - traceability        : context dict passed to storage with condition_id, slug, etc.
   - price source        : prices_direct vs prices_midpoint counters
+  - multi-source        : Binance spot + reference price integrated into cycle
+  - external failures   : external-source failure does not crash cycle
 
 All dependencies are mocked — no live API calls.
 """
@@ -22,6 +24,8 @@ from unittest.mock import MagicMock
 
 from src.data.fetcher import DataFetcher
 from src.data.storage import DataStorage
+from src.external.binance_spot import BinanceSpotFetcher
+from src.external.reference_price import ReferencePriceFetcher
 from src.polymarket.markets import MarketDiscovery
 from src.polymarket.models import (
     Market,
@@ -80,6 +84,8 @@ def _build(
     markets: list[Market] | Exception | None = None,
     price_effect: object = None,
     book_effect: object = None,
+    binance_fetcher: MagicMock | None = None,
+    reference_fetcher: MagicMock | None = None,
 ) -> tuple[DataFetcher, MagicMock, MagicMock, MagicMock]:
     """
     Build a DataFetcher with mocked dependencies.
@@ -107,7 +113,11 @@ def _build(
 
     storage = MagicMock(spec=DataStorage)
 
-    fetcher = DataFetcher(discovery, pf, storage)
+    fetcher = DataFetcher(
+        discovery, pf, storage,
+        binance_fetcher=binance_fetcher,
+        reference_fetcher=reference_fetcher,
+    )
     return fetcher, discovery, pf, storage
 
 
@@ -322,3 +332,151 @@ def test_snapshot_storage_failure_continues_to_prices() -> None:
     # Prices/orderbooks still attempted despite snapshot failure
     assert result.prices_stored == 1
     assert result.orderbooks_stored == 1
+
+
+# ---------------------------------------------------------------------------
+# Multi-source cycle (Binance spot + reference price)
+# ---------------------------------------------------------------------------
+
+
+def _mock_binance() -> MagicMock:
+    """Return a MagicMock for BinanceSpotFetcher with a default tick."""
+    mock = MagicMock(spec=BinanceSpotFetcher)
+    tick = MagicMock()
+    tick.price = 84273.49
+    mock.fetch_latest_trade.return_value = tick
+    return mock
+
+
+def _mock_reference() -> MagicMock:
+    """Return a MagicMock for ReferencePriceFetcher with a default tick."""
+    mock = MagicMock(spec=ReferencePriceFetcher)
+    tick = MagicMock()
+    tick.price = 84273.49
+    tick.is_proxy = True
+    mock.fetch_reference_price.return_value = tick
+    return mock
+
+
+def test_multi_source_happy_path() -> None:
+    """Full cycle: Polymarket + Binance spot + reference price all succeed."""
+    binance = _mock_binance()
+    reference = _mock_reference()
+    fetcher, _, _, storage = _build(
+        markets=[_market("c1", n_tokens=1)],
+        binance_fetcher=binance,
+        reference_fetcher=reference,
+    )
+
+    result = fetcher.run_cycle()
+
+    assert result.markets_found == 1
+    assert result.prices_stored == 1
+    assert result.orderbooks_stored == 1
+    assert result.binance_spot_stored == 1
+    assert result.reference_price_stored == 1
+    assert result.errors == 0
+    storage.append_binance_spot_tick.assert_called_once()
+    storage.append_reference_price_tick.assert_called_once()
+
+
+def test_multi_source_run_id_propagated() -> None:
+    """Same run_id should appear in all storage calls within one cycle."""
+    binance = _mock_binance()
+    reference = _mock_reference()
+    fetcher, _, _, storage = _build(
+        markets=[_market("c1", n_tokens=1)],
+        binance_fetcher=binance,
+        reference_fetcher=reference,
+    )
+
+    fetcher.run_cycle()
+
+    # Extract run_id from each storage call
+    snap_run_id = storage.save_market_snapshot.call_args[1]["run_id"]
+    price_run_id = storage.append_price.call_args[1]["run_id"]
+    book_run_id = storage.append_orderbook.call_args[1]["run_id"]
+    binance_run_id = storage.append_binance_spot_tick.call_args[1]["run_id"]
+    ref_run_id = storage.append_reference_price_tick.call_args[1]["run_id"]
+
+    assert snap_run_id == price_run_id == book_run_id == binance_run_id == ref_run_id
+    assert snap_run_id is not None
+
+
+def test_binance_failure_does_not_crash_cycle() -> None:
+    """Binance spot failure is logged but cycle still returns successfully."""
+    binance = MagicMock(spec=BinanceSpotFetcher)
+    binance.fetch_latest_trade.side_effect = RuntimeError("Binance down")
+    reference = _mock_reference()
+    fetcher, _, _, storage = _build(
+        markets=[_market("c1", n_tokens=1)],
+        binance_fetcher=binance,
+        reference_fetcher=reference,
+    )
+
+    result = fetcher.run_cycle()
+
+    assert result.binance_spot_stored == 0
+    assert result.reference_price_stored == 1  # reference still works
+    assert result.prices_stored == 1  # Polymarket still works
+    assert result.errors >= 1
+
+
+def test_reference_failure_does_not_crash_cycle() -> None:
+    """Reference price failure is logged but cycle still returns successfully."""
+    binance = _mock_binance()
+    reference = MagicMock(spec=ReferencePriceFetcher)
+    reference.fetch_reference_price.side_effect = RuntimeError("ref down")
+    fetcher, _, _, storage = _build(
+        markets=[_market("c1", n_tokens=1)],
+        binance_fetcher=binance,
+        reference_fetcher=reference,
+    )
+
+    result = fetcher.run_cycle()
+
+    assert result.reference_price_stored == 0
+    assert result.binance_spot_stored == 1  # binance still works
+    assert result.prices_stored == 1  # Polymarket still works
+    assert result.errors >= 1
+
+
+def test_both_external_failures_do_not_crash_cycle() -> None:
+    """Both external failures are logged; Polymarket part is unaffected."""
+    binance = MagicMock(spec=BinanceSpotFetcher)
+    binance.fetch_latest_trade.side_effect = RuntimeError("Binance down")
+    reference = MagicMock(spec=ReferencePriceFetcher)
+    reference.fetch_reference_price.side_effect = RuntimeError("ref down")
+    fetcher, _, _, storage = _build(
+        markets=[_market("c1", n_tokens=1)],
+        binance_fetcher=binance,
+        reference_fetcher=reference,
+    )
+
+    result = fetcher.run_cycle()
+
+    assert result.binance_spot_stored == 0
+    assert result.reference_price_stored == 0
+    assert result.prices_stored == 1
+    assert result.orderbooks_stored == 1
+    assert result.errors == 2  # one per external source
+
+
+def test_no_external_fetchers_polymarket_only() -> None:
+    """When external fetchers are None, only Polymarket data is collected."""
+    fetcher, _, _, storage = _build(
+        markets=[_market("c1", n_tokens=1)],
+        binance_fetcher=None,
+        reference_fetcher=None,
+    )
+
+    result = fetcher.run_cycle()
+
+    assert result.markets_found == 1
+    assert result.prices_stored == 1
+    assert result.orderbooks_stored == 1
+    assert result.binance_spot_stored == 0
+    assert result.reference_price_stored == 0
+    assert result.errors == 0
+    storage.append_binance_spot_tick.assert_not_called()
+    storage.append_reference_price_tick.assert_not_called()

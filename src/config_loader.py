@@ -56,6 +56,8 @@ class StorageConfig(BaseModel):
     market_snapshots_dir: str
     price_data_dir: str
     orderbook_data_dir: str
+    binance_spot_data_dir: str
+    reference_price_data_dir: str
 
 
 class PolymarketConfig(BaseModel):

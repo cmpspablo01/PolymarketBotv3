@@ -37,8 +37,8 @@ External-source storage:
   - BinanceSpotTick and ReferencePriceTick are serialized via ``model_dump``
     with all provenance fields preserved (exchange_timestamp, source_timestamp,
     local_receive_timestamp, processed_timestamp, source, is_proxy, etc.).
-  - ``written_at`` is the only field added by the storage layer.
-  - No fields are renamed, dropped, or wrapped during serialization.
+  - ``run_id`` and ``written_at`` are the only fields added by the storage layer.
+  - No source/provenance fields are renamed, dropped, or wrapped during serialization.
 
 Traceability:
   - ``append_price`` and ``append_orderbook`` accept an optional *context*
@@ -81,8 +81,8 @@ class DataStorage:
         storage.save_market_snapshot(markets, snapshot_ts, run_id=run_id)
         storage.append_price(price, run_ts, run_id=run_id, context={...})
         storage.append_orderbook(orderbook, run_ts, run_id=run_id, context={...})
-        storage.append_binance_spot_tick(tick, run_ts)
-        storage.append_reference_price_tick(tick, run_ts)
+        storage.append_binance_spot_tick(tick, run_ts, run_id=run_id)
+        storage.append_reference_price_tick(tick, run_ts, run_id=run_id)
     """
 
     def __init__(
@@ -226,14 +226,16 @@ class DataStorage:
         self,
         tick: BinanceSpotTick,
         run_ts: datetime,
+        run_id: str | None = None,
     ) -> Path:
         """
         Append a single Binance spot tick to the daily JSONL file.
 
-        Uses ``run_ts`` for daily filename derivation (consistent with
-        Polymarket storage).  All model fields are preserved via
-        ``model_dump``.  A ``written_at`` field is added for write-time
-        auditing — it is clearly separate from exchange/local timestamps.
+        Uses ``run_ts`` (the cycle timestamp) for daily filename
+        derivation — **not** the tick's ``exchange_timestamp``.  All
+        model fields are preserved via ``model_dump``.  Adds ``run_id``
+        and ``written_at`` fields for cycle-level traceability — both
+        are clearly separate from exchange/local timestamps.
 
         Returns the path to the JSONL file.
 
@@ -251,6 +253,7 @@ class DataStorage:
         file_path = self._binance_spot_dir / f"binance_spot_{date_str}.jsonl"
 
         record = tick.model_dump(mode="json")
+        record["run_id"] = run_id
         record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
 
         with file_path.open("a", encoding="utf-8") as f:
@@ -266,15 +269,18 @@ class DataStorage:
         self,
         tick: ReferencePriceTick,
         run_ts: datetime,
+        run_id: str | None = None,
     ) -> Path:
         """
         Append a single reference-price tick to the daily JSONL file.
 
-        Uses ``run_ts`` for daily filename derivation.  All model fields
-        are preserved via ``model_dump``, including proxy metadata
-        (``is_proxy``, ``proxy_description``, ``source``).  A
-        ``written_at`` field is added for write-time auditing — it is
-        clearly separate from source/local timestamps.
+        Uses ``run_ts`` (the cycle timestamp) for daily filename
+        derivation — **not** the tick's ``source_timestamp``.  All
+        model fields are preserved via ``model_dump``, including proxy
+        metadata (``is_proxy``, ``proxy_description``, ``source``).
+        Adds ``run_id`` and ``written_at`` fields for cycle-level
+        traceability — both are clearly separate from source/local
+        timestamps.
 
         Returns the path to the JSONL file.
 
@@ -292,6 +298,7 @@ class DataStorage:
         file_path = self._reference_price_dir / f"reference_price_{date_str}.jsonl"
 
         record = tick.model_dump(mode="json")
+        record["run_id"] = run_id
         record["written_at"] = datetime.now(tz=timezone.utc).isoformat()
 
         with file_path.open("a", encoding="utf-8") as f:

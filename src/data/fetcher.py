@@ -1,13 +1,16 @@
 """
-Synchronous data fetcher orchestrating market discovery, price/orderbook
-collection, and storage.
+Synchronous data fetcher orchestrating multi-source data collection and storage.
 
 Responsibilities:
-  - Wire together MarketDiscovery, PriceFetcher, and DataStorage
-  - Run one fetch cycle: discover → fetch orderbooks/prices → persist
+  - Wire together MarketDiscovery, PriceFetcher, external fetchers, and DataStorage
+  - Run one fetch cycle: discover → fetch Polymarket orderbooks/prices →
+    fetch Binance spot → fetch reference price → persist all
   - Pass traceability context (condition_id, outcome, slug, event_id) to storage
   - Track price source (clob_midpoint via /midpoint vs book_midpoint fallback)
-  - Handle partial failures gracefully (one bad token never crashes the cycle)
+  - Propagate a single run_id across all storage writes in a cycle
+  - Handle partial failures gracefully:
+    - One bad token never crashes the Polymarket loop
+    - External-source failure does not kill the cycle or block other sources
   - Log key events for debugging
 
 Does NOT:
@@ -25,6 +28,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.data.storage import DataStorage
+from src.external.binance_spot import BinanceSpotFetcher
+from src.external.reference_price import ReferencePriceFetcher
 from src.polymarket.markets import MarketDiscovery
 from src.polymarket.prices import PriceFetcher, midpoint_from_book
 
@@ -40,16 +45,22 @@ class FetchCycleResult:
     prices_direct: int = 0
     prices_midpoint: int = 0
     orderbooks_stored: int = 0
+    binance_spot_stored: int = 0
+    reference_price_stored: int = 0
     errors: int = 0
 
 
 class DataFetcher:
     """
-    Thin synchronous orchestrator for one fetch cycle.
+    Thin synchronous orchestrator for one multi-source fetch cycle.
 
     Usage::
 
-        fetcher = DataFetcher(discovery, price_fetcher, storage)
+        fetcher = DataFetcher(
+            discovery, price_fetcher, storage,
+            binance_fetcher=binance_fetcher,
+            reference_fetcher=reference_fetcher,
+        )
         result = fetcher.run_cycle()
     """
 
@@ -58,19 +69,27 @@ class DataFetcher:
         discovery: MarketDiscovery,
         price_fetcher: PriceFetcher,
         storage: DataStorage,
+        binance_fetcher: BinanceSpotFetcher | None = None,
+        reference_fetcher: ReferencePriceFetcher | None = None,
     ) -> None:
         self._discovery = discovery
         self._price_fetcher = price_fetcher
         self._storage = storage
+        self._binance_fetcher = binance_fetcher
+        self._reference_fetcher = reference_fetcher
 
     def run_cycle(self) -> FetchCycleResult:
         """
-        Run one discovery → orderbook/price → storage cycle.
+        Run one multi-source collection cycle.
+
+        Sequence: discover → snapshot → Polymarket orderbooks/prices →
+        Binance spot → reference price.
 
         Generates a unique run_id to link all artifacts (snapshot, prices,
-        orderbooks) produced during this cycle for traceability.
+        orderbooks, external ticks) produced during this cycle.
 
         Partial failures are logged and counted but never crash the cycle.
+        External-source failures are isolated from Polymarket collection.
         Returns a :class:`FetchCycleResult` summarizing what happened.
         """
         run_id = str(uuid.uuid4())
@@ -173,6 +192,38 @@ class DataFetcher:
                     log.warning("Price unavailable for %s", tid[:24])
                     result.errors += 1
 
+        # --- 4. Fetch + store Binance spot tick -------------------------
+        if self._binance_fetcher is not None:
+            try:
+                tick = self._binance_fetcher.fetch_latest_trade()
+                self._storage.append_binance_spot_tick(
+                    tick, run_ts, run_id=run_id
+                )
+                result.binance_spot_stored += 1
+                log.info(
+                    "Binance spot tick stored: %.2f", tick.price,
+                )
+            except Exception as exc:
+                log.warning("Binance spot fetch/store failed: %s", exc)
+                result.errors += 1
+
+        # --- 5. Fetch + store reference price tick -----------------------
+        if self._reference_fetcher is not None:
+            try:
+                ref_tick = self._reference_fetcher.fetch_reference_price()
+                self._storage.append_reference_price_tick(
+                    ref_tick, run_ts, run_id=run_id
+                )
+                result.reference_price_stored += 1
+                log.info(
+                    "Reference price tick stored: %.2f (proxy=%s)",
+                    ref_tick.price,
+                    ref_tick.is_proxy,
+                )
+            except Exception as exc:
+                log.warning("Reference price fetch/store failed: %s", exc)
+                result.errors += 1
+
         _log_cycle_summary(result)
         return result
 
@@ -194,11 +245,14 @@ def _log_cycle_summary(result: FetchCycleResult) -> None:
     """Emit an INFO-level summary of the fetch cycle."""
     log.info(
         "Fetch cycle complete: %d markets, %d orderbooks, "
-        "%d prices (direct=%d, midpoint=%d), %d errors",
+        "%d prices (direct=%d, midpoint=%d), "
+        "binance_spot=%d, reference_price=%d, %d errors",
         result.markets_found,
         result.orderbooks_stored,
         result.prices_stored,
         result.prices_direct,
         result.prices_midpoint,
+        result.binance_spot_stored,
+        result.reference_price_stored,
         result.errors,
     )

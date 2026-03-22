@@ -9,7 +9,7 @@ Startup sequence (order is intentional):
   5. Build data pipeline components   — explicit construction, no DI framework
   6. Run collection cycle(s)          — once or loop per runner.mode
 
-Phase 1 status: End-to-end data collection wired.
+Phase 2 status: Multi-source data collection (Polymarket + Binance spot + reference price).
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ from typing import Any
 from src.config_loader import ConfigurationError, Settings, load_config
 from src.data.fetcher import DataFetcher, FetchCycleResult
 from src.data.storage import DataStorage
+from src.external.binance_spot import BinanceSpotFetcher
+from src.external.reference_price import ReferencePriceFetcher
 from src.logger import get_logger, setup_logging
 from src.polymarket.http_client import PolymarketHTTPClient
 from src.polymarket.markets import MarketDiscovery
@@ -47,6 +49,8 @@ def _ensure_directories(settings: Settings) -> None:
         settings.storage.market_snapshots_dir,
         settings.storage.price_data_dir,
         settings.storage.orderbook_data_dir,
+        settings.storage.binance_spot_data_dir,
+        settings.storage.reference_price_data_dir,
     ]
     for dir_path in dirs:
         Path(dir_path).mkdir(parents=True, exist_ok=True)
@@ -68,6 +72,8 @@ def _run_once(fetcher: DataFetcher, log: Any) -> FetchCycleResult:
         prices_direct=result.prices_direct,
         prices_midpoint=result.prices_midpoint,
         orderbooks_stored=result.orderbooks_stored,
+        binance_spot_stored=result.binance_spot_stored,
+        reference_price_stored=result.reference_price_stored,
         errors=result.errors,
     )
     return result
@@ -98,6 +104,8 @@ def _run_loop(
                 prices_direct=result.prices_direct,
                 prices_midpoint=result.prices_midpoint,
                 orderbooks_stored=result.orderbooks_stored,
+                binance_spot_stored=result.binance_spot_stored,
+                reference_price_stored=result.reference_price_stored,
                 errors=result.errors,
             )
         except Exception as exc:
@@ -140,17 +148,28 @@ def main() -> None:
     # 6. Build components explicitly — no DI framework
     #    gamma_client → discovery (Gamma API for event/market listing)
     #    clob_client  → price_fetcher (CLOB API for orderbooks/prices)
+    #    binance_fetcher / reference_fetcher use requests directly
     gamma_client = PolymarketHTTPClient(base_url=settings.polymarket.gamma_base_url)
     clob_client = PolymarketHTTPClient(base_url=settings.polymarket.base_url)
     try:
         discovery = MarketDiscovery(gamma_client)
         price_fetcher = PriceFetcher(clob_client)
+        binance_fetcher = BinanceSpotFetcher()
+        reference_fetcher = ReferencePriceFetcher(binance_fetcher)
         storage = DataStorage(
             markets_dir=Path(settings.storage.market_snapshots_dir),
             prices_dir=Path(settings.storage.price_data_dir),
             orderbooks_dir=Path(settings.storage.orderbook_data_dir),
+            binance_spot_dir=Path(settings.storage.binance_spot_data_dir),
+            reference_price_dir=Path(settings.storage.reference_price_data_dir),
         )
-        fetcher = DataFetcher(discovery, price_fetcher, storage)
+        fetcher = DataFetcher(
+            discovery,
+            price_fetcher,
+            storage,
+            binance_fetcher=binance_fetcher,
+            reference_fetcher=reference_fetcher,
+        )
 
         log.info("components_ready")
 
